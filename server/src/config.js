@@ -158,6 +158,7 @@ export const DEFAULT_CORS_ALLOWED_HEADERS = [
   "X-Actor",
   "X-User-Tier",
   "X-API-Version",
+  "X-Encryption-Session",
 ];
 
 export const DEFAULT_CORS_EXPOSED_HEADERS = [
@@ -332,6 +333,16 @@ export function loadConfig(env = process.env) {
     requestSigningEnforce:
       (env.REQUEST_SIGNING_ENFORCE ?? "mutations").toLowerCase() === "all" ? "all" : "mutations",
     requestSigningMaxAgeSeconds: parseInteger(env.REQUEST_SIGNING_MAX_AGE_SECONDS, 300),
+    // AES-GCM application payload encryption. When enabled, credential routes
+    // require an authenticated X25519 session before accepting or returning
+    // credential payloads.
+    payloadEncryptionEnabled: parseBoolean(env.PAYLOAD_ENCRYPTION_ENABLED, false),
+    payloadEncryptionSessionTtlSeconds: parseInteger(env.PAYLOAD_ENCRYPTION_SESSION_TTL_SECONDS, 900),
+    payloadEncryptionRotationGraceSeconds: parseInteger(env.PAYLOAD_ENCRYPTION_ROTATION_GRACE_SECONDS, 60, true),
+    payloadEncryptionSensitiveFields: parseList(
+      env.PAYLOAD_ENCRYPTION_SENSITIVE_FIELDS,
+      ["credentialSubject", "claims", "subject"],
+    ),
     // Nonce-based replay prevention (#1052). Off by default for the same
     // reason as request signing: enabling it rejects requests from clients
     // that do not yet send a nonce.
@@ -603,4 +614,371 @@ export function loadConfig(env = process.env) {
     // endpoints configured every query goes to the primary, so an existing
     // single-region deployment is unaffected.
     readReplicasEnabled: parseBoolean(env.READ_REPLICAS_ENABLED, false),
-    // Region -> replica endpoint, e.g. {"us":"https://us
+    // Region -> replica endpoint, e.g. {"us":"https://us.db.example.com"}.
+    replicaEndpoints: parseReplicaEndpoints(env.REPLICA_ENDPOINTS),
+    // Region -> nearest replica region, e.g. {"us-east-1":"us"}.
+    replicaRegionRouting: parseRegionRouting(env.REPLICA_REGION_ROUTING),
+    // Region this instance runs in; used as the routing fallback.
+    replicaLocalRegion: (env.REPLICA_LOCAL_REGION ?? "").trim().toLowerCase(),
+    // Replica lag above this (ms) takes the replica out of rotation.
+    replicaMaxLagMs: parseInteger(env.REPLICA_MAX_LAG_MS, 5000),
+    // Lag above this (ms) is logged as a warning but still serves reads.
+    replicaWarnLagMs: parseInteger(env.REPLICA_WARN_LAG_MS, 1000),
+    // How often replica lag is sampled (0 disables the monitor).
+    replicaLagCheckIntervalMs: parseInteger(
+      env.REPLICA_LAG_CHECK_INTERVAL_MS,
+      10_000,
+      true,
+    ),
+    // Consecutive failed health checks before a replica is marked down.
+    replicaFailureThreshold: parseInteger(env.REPLICA_FAILURE_THRESHOLD, 3),
+    // Consecutive successful checks before a down replica is restored.
+    replicaRecoveryThreshold: parseInteger(env.REPLICA_RECOVERY_THRESHOLD, 2),
+    // When true, reads fall back to the primary if every replica is unhealthy.
+    replicaFailoverToPrimary: parseBoolean(env.REPLICA_FAILOVER_TO_PRIMARY, true),
+    // When true, a read that must observe its own write is sent to the primary
+    // instead of a possibly-stale replica.
+    replicaReadAfterWriteConsistency: parseBoolean(
+      env.REPLICA_READ_AFTER_WRITE_CONSISTENCY,
+      true,
+    ),
+    // Window (ms) after a write during which reads are pinned to the primary.
+    replicaConsistencyWindowMs: parseInteger(
+      env.REPLICA_CONSISTENCY_WINDOW_MS,
+      2000,
+    ),
+    // Jaeger distributed tracing (#714)
+    jaegerEnabled: parseBoolean(env.JAEGER_ENABLED, false),
+    jaegerServiceName: env.JAEGER_SERVICE_NAME ?? "soroban-identity-server",
+    jaegerAgentHost: env.JAEGER_AGENT_HOST ?? "localhost",
+    jaegerAgentPort: parseInteger(env.JAEGER_AGENT_PORT, 6832),
+    jaegerSamplerType: env.JAEGER_SAMPLER_TYPE ?? "const",
+    jaegerSamplerParam: parseFloat(env.JAEGER_SAMPLER_PARAM ?? "1"),
+    jaegerReporterLogSpans: parseBoolean(env.JAEGER_REPORTER_LOG_SPANS, false),
+    jaegerReporterFlushInterval: parseInteger(env.JAEGER_REPORTER_FLUSH_INTERVAL, 1000),
+  };
+}
+
+export function validateConfig(env = process.env) {
+  const missing = [];
+  const invalid = [];
+
+  const sourceAccount = resolveSourceAccount(env);
+  if (!sourceAccount) {
+    missing.push("STELLAR_SECRET_KEY: Stellar account secret key (S…)");
+  } else {
+    if (!/^S[A-Z2-7]{55}$/.test(sourceAccount)) {
+      invalid.push(
+        "STELLAR_SECRET_KEY: Stellar account secret key must start with S and be 56 characters long",
+      );
+    }
+  }
+
+  const credentialContract =
+    env.CREDENTIAL_CONTRACT_ID ?? env.CREDENTIAL_MANAGER_ID;
+  if (!credentialContract) {
+    missing.push(
+      "CREDENTIAL_CONTRACT_ID: deployed credential contract address",
+    );
+  } else {
+    if (!/^C[A-Z2-7]{55}$/.test(credentialContract)) {
+      invalid.push(
+        "CREDENTIAL_CONTRACT_ID: deployed credential contract address must start with C and be 56 characters long",
+      );
+    }
+  }
+
+  const numericVars = [
+    { key: "PORT", desc: "must be a valid integer" },
+    { key: "EXPIRY_WARNING_DAYS", desc: "must be a valid integer" },
+    { key: "EXPIRY_JOB_INTERVAL_MS", desc: "must be a valid integer" },
+    { key: "EXPIRY_CONCURRENCY", desc: "must be a valid integer" },
+    { key: "SOROBAN_POOL_SIZE", desc: "must be a valid integer" },
+    { key: "SOROBAN_INVOKE_TIMEOUT_MS", desc: "must be a valid integer" },
+    { key: "RPC_CACHE_TTL_MS", desc: "must be a valid integer" },
+    { key: "RPC_MAX_RETRIES", desc: "must be a valid integer" },
+    { key: "RPC_RETRY_BASE_MS", desc: "must be a valid integer" },
+    { key: "RPC_RETRY_BACKOFF", desc: "must be a valid integer" },
+    { key: "EVENT_POLL_INTERVAL_MS", desc: "must be a valid integer" },
+    { key: "LONG_POLL_DEFAULT_TIMEOUT_MS", desc: "must be a valid integer" },
+    { key: "LONG_POLL_MAX_TIMEOUT_MS", desc: "must be a valid integer" },
+    { key: "RATE_LIMIT_MAX_BUCKETS", desc: "must be a valid integer" },
+    { key: "CORS_MAX_AGE", desc: "must be a valid integer" },
+    { key: "ACCESS_LOG_MAX_BYTES", desc: "must be a valid integer" },
+    { key: "ACCESS_LOG_MAX_FILES", desc: "must be a valid integer" },
+    { key: "LOG_PAYLOAD_MAX_BYTES", desc: "must be a valid integer" },
+    { key: "PAYLOAD_ENCRYPTION_SESSION_TTL_SECONDS", desc: "must be a valid integer" },
+    { key: "PAYLOAD_ENCRYPTION_ROTATION_GRACE_SECONDS", desc: "must be a valid integer" },
+    { key: "OAUTH_AUTH_CODE_TTL_MS", desc: "must be a valid integer" },
+    { key: "OAUTH_ACCESS_TOKEN_TTL_MS", desc: "must be a valid integer" },
+    { key: "OAUTH_REFRESH_TOKEN_TTL_MS", desc: "must be a valid integer" },
+    { key: "REQUEST_NONCE_TTL_SECONDS", desc: "must be a valid integer" },
+  ];
+
+  for (const item of numericVars) {
+    const val = env[item.key];
+    if (val !== undefined && val !== "") {
+      if (!/^\d+$/.test(val)) {
+        invalid.push(`${item.key}: ${item.desc}`);
+      }
+    }
+  }
+
+  const corsOrigin = env.CORS_ORIGIN ?? env.CORS_ALLOWED_ORIGINS;
+  if (corsOrigin !== undefined && corsOrigin !== "" && corsOrigin.trim() !== "*") {
+    for (const origin of corsOrigin.split(",").map((o) => o.trim()).filter(Boolean)) {
+      let parsed;
+      try {
+        parsed = new URL(origin);
+      } catch {
+        invalid.push(
+          `CORS_ORIGIN: '${origin}' must be an absolute origin such as https://app.example.com, or '*'`,
+        );
+        continue;
+      }
+      // An Origin header carries scheme://host[:port] and nothing else, so a
+      // configured value with a path or query can never match a real request.
+      if (parsed.pathname !== "/" || parsed.search || parsed.hash) {
+        invalid.push(
+          `CORS_ORIGIN: '${origin}' must not include a path, query or fragment`,
+        );
+      }
+    }
+  }
+
+  const corsCredentials = env.CORS_CREDENTIALS;
+  if (corsCredentials !== undefined && corsCredentials !== "") {
+    const normalized = String(corsCredentials).trim().toLowerCase();
+    const known = ["true", "1", "yes", "on", "false", "0", "no", "off"];
+    if (!known.includes(normalized)) {
+      invalid.push("CORS_CREDENTIALS: must be one of true/false/1/0/yes/no/on/off");
+    } else if (["true", "1", "yes", "on"].includes(normalized)) {
+      // The CORS spec forbids credentials with a wildcard origin: a browser
+      // rejects the response outright, so this combination is never usable.
+      const nodeEnvValue = env.NODE_ENV ?? "development";
+      const effectiveOrigins =
+        corsOrigin ?? (nodeEnvValue === "development" ? "*" : "");
+      if (String(effectiveOrigins).trim() === "*") {
+        invalid.push(
+          "CORS_CREDENTIALS: cannot be enabled while CORS_ORIGIN is '*' — name the allowed origins explicitly",
+        );
+      }
+    }
+  }
+
+  const rpcUrl = env.STELLAR_RPC_URL ?? env.RPC_URL;
+  if (rpcUrl !== undefined && rpcUrl !== "") {
+    try {
+      new URL(rpcUrl);
+    } catch {
+      invalid.push("STELLAR_RPC_URL: must be a valid URL");
+    }
+  }
+
+  const redisUrl = env.REDIS_URL;
+  if (redisUrl !== undefined && redisUrl !== "") {
+    try {
+      const parsed = new URL(redisUrl);
+      if (parsed.protocol !== "redis:" && parsed.protocol !== "rediss:") {
+        invalid.push("REDIS_URL: must use the redis:// or rediss:// scheme");
+      }
+    } catch {
+      invalid.push("REDIS_URL: must be a valid URL");
+    }
+  }
+
+  const webhookUrl = env.NOTIFICATION_WEBHOOK_URL;
+  if (webhookUrl !== undefined && webhookUrl !== "") {
+    try {
+      new URL(webhookUrl);
+    } catch {
+      invalid.push("NOTIFICATION_WEBHOOK_URL: must be a valid URL");
+    }
+  }
+
+  const emailApiUrl = env.EMAIL_API_URL;
+  if (emailApiUrl !== undefined && emailApiUrl !== "") {
+    try {
+      new URL(emailApiUrl);
+    } catch {
+      invalid.push("EMAIL_API_URL: must be a valid URL");
+    }
+    if (!env.EMAIL_FROM) {
+      invalid.push("EMAIL_FROM: required when EMAIL_API_URL is set");
+    }
+  }
+
+  // Geo-distributed read replicas (#1051): every configured endpoint must be a
+  // usable URL, and routing must only point at regions that exist.
+  const replicaEndpoints = parseReplicaEndpoints(env.REPLICA_ENDPOINTS);
+  for (const [region, endpoint] of Object.entries(replicaEndpoints)) {
+    try {
+      new URL(endpoint);
+    } catch {
+      invalid.push(
+        `REPLICA_ENDPOINTS: '${region}' must map to a valid URL, got '${endpoint}'`,
+      );
+    }
+  }
+
+  const replicaRouting = parseRegionRouting(env.REPLICA_REGION_ROUTING);
+  for (const [region, replica] of Object.entries(replicaRouting)) {
+    if (!replicaEndpoints[replica]) {
+      invalid.push(
+        `REPLICA_REGION_ROUTING: '${region}' points at unknown replica region '${replica}'`,
+      );
+    }
+  }
+
+  if (
+    parseBoolean(env.READ_REPLICAS_ENABLED, false) &&
+    Object.keys(replicaEndpoints).length === 0
+  ) {
+    invalid.push(
+      "REPLICA_ENDPOINTS: required when READ_REPLICAS_ENABLED is true",
+    );
+  }
+
+  const replicaLocalRegion = (env.REPLICA_LOCAL_REGION ?? "").trim().toLowerCase();
+  if (
+    replicaLocalRegion &&
+    Object.keys(replicaEndpoints).length > 0 &&
+    !replicaEndpoints[replicaLocalRegion] &&
+    !replicaRouting[replicaLocalRegion]
+  ) {
+    invalid.push(
+      `REPLICA_LOCAL_REGION: '${replicaLocalRegion}' is neither a replica endpoint nor a routing key`,
+    );
+  }
+
+  const cronSchedule = env.EXPIRY_CRON_SCHEDULE;
+  if (cronSchedule !== undefined && cronSchedule !== "") {
+    try {
+      parseCronExpression(cronSchedule);
+    } catch (error) {
+      invalid.push(`EXPIRY_CRON_SCHEDULE: ${error.message}`);
+    }
+  }
+
+  const encryptionEnabled = parseBoolean(env.ENCRYPTION_ENABLED, false);
+  if (encryptionEnabled) {
+    const rotation = parseInteger(
+      env.ENCRYPTION_KEY_ROTATION_SECONDS,
+      DEFAULT_ENCRYPTION_KEY_ROTATION_SECONDS,
+    );
+    const ttl = parseInteger(
+      env.ENCRYPTION_SESSION_TTL_SECONDS,
+      DEFAULT_ENCRYPTION_SESSION_TTL_SECONDS,
+    );
+    // A rotation interval at or beyond the session TTL would let a key expire
+    // before it is ever rotated, leaving clients unable to decrypt responses.
+    if (rotation >= ttl) {
+      invalid.push(
+        "ENCRYPTION_KEY_ROTATION_SECONDS: must be less than ENCRYPTION_SESSION_TTL_SECONDS",
+      );
+    }
+    const fields = parseList(env.ENCRYPTION_SENSITIVE_FIELDS, []);
+    if (fields.length === 0) {
+      invalid.push(
+        "ENCRYPTION_SENSITIVE_FIELDS: must list at least one response field when ENCRYPTION_ENABLED is true",
+      );
+    }
+  }
+
+  return {
+    isValid: missing.length === 0 && invalid.length === 0,
+    missing,
+    invalid,
+  };
+}
+
+export function logDefaultValues(env = process.env) {
+  const defaults = [
+    { key: "PORT", defaultVal: "3001" },
+    { key: "ADMIN_API_KEY", defaultVal: "''" },
+    { key: "ADMIN_ACTOR", defaultVal: "'admin'" },
+    { key: "DATA_DIR", defaultVal: "data" },
+    { key: "EXPIRY_WARNING_DAYS", defaultVal: "7" },
+    { key: "EXPIRY_JOB_INTERVAL_MS", defaultVal: "3600000" },
+    { key: "EXPIRY_CONCURRENCY", defaultVal: "8" },
+    { key: "RATE_LIMIT_WHITELIST", defaultVal: "'' (no exemptions)" },
+    { key: "RATE_LIMIT_MAX_BUCKETS", defaultVal: "10000" },
+    { key: "TRUST_PROXY", defaultVal: "false" },
+    { key: "REDIS_URL", defaultVal: "'' (cache disabled)" },
+    { key: "DID_CACHE_TTL_MS", defaultVal: "60000" },
+    { key: "REDIS_MAX_RETRIES", defaultVal: "5" },
+    { key: "CACHE_FAILURE_THRESHOLD", defaultVal: "3" },
+    { key: "HEALTH_PROBE_TIMEOUT_MS", defaultVal: "2000" },
+    { key: "REDIS_URL", defaultVal: "'' (disabled)" },
+    { key: "EXPIRY_CRON_SCHEDULE", defaultVal: "'' (interval mode)" },
+    { key: "ACCESS_LOG_ENABLED", defaultVal: "true" },
+    { key: "ACCESS_LOG_PATH", defaultVal: "'' (stdout only)" },
+    { key: "ACCESS_LOG_MAX_BYTES", defaultVal: "10485760" },
+    { key: "ACCESS_LOG_MAX_FILES", defaultVal: "5" },
+    { key: "LOG_PAYLOADS", defaultVal: "false" },
+    { key: "LOG_HEADERS", defaultVal: "false" },
+    { key: "TRUST_PROXY", defaultVal: "false" },
+    { key: "NOTIFICATION_WEBHOOK_URL", defaultVal: "''" },
+    { key: "EMAIL_API_URL", defaultVal: "''" },
+    { key: "EMAIL_FROM", defaultVal: "''" },
+    { key: "NOTIFICATION_EMAIL", defaultVal: "''" },
+    { key: "NOTIFICATION_MAX_RETRIES", defaultVal: "3" },
+    { key: "NOTIFICATION_RETRY_BASE_MS", defaultVal: "500" },
+    { key: "SUBJECT_NOTIFICATION_WEBHOOKS", defaultVal: "{}" },
+    { key: "SOROBAN_POOL_SIZE", defaultVal: "4" },
+    { key: "SOROBAN_INVOKE_TIMEOUT_MS", defaultVal: "10000" },
+    { key: "STELLAR_CLI", defaultVal: "'stellar'" },
+    { key: "STELLAR_NETWORK", defaultVal: "'testnet'" },
+    {
+      key: "STELLAR_RPC_URL",
+      defaultVal: "'https://soroban-testnet.stellar.org'",
+    },
+    { key: "RPC_CACHE_TTL_MS", defaultVal: "5000" },
+    { key: "RPC_MAX_RETRIES", defaultVal: "3" },
+    { key: "RPC_RETRY_BASE_MS", defaultVal: "500" },
+    { key: "RPC_RETRY_BACKOFF", defaultVal: "2" },
+    { key: "EVENT_POLL_INTERVAL_MS", defaultVal: "5000" },
+    { key: "LONG_POLL_DEFAULT_TIMEOUT_MS", defaultVal: "30000" },
+    { key: "LONG_POLL_MAX_TIMEOUT_MS", defaultVal: "60000" },
+    { key: "QUOTA_OVERAGE_MODE", defaultVal: "'block'" },
+    { key: "CORS_ORIGIN", defaultVal: "'*' in development, none in production" },
+    { key: "CORS_CREDENTIALS", defaultVal: "false" },
+    { key: "CORS_METHODS", defaultVal: DEFAULT_CORS_METHODS.join(",") },
+    { key: "CORS_ALLOWED_HEADERS", defaultVal: DEFAULT_CORS_ALLOWED_HEADERS.join(",") },
+    { key: "CORS_EXPOSED_HEADERS", defaultVal: DEFAULT_CORS_EXPOSED_HEADERS.join(",") },
+    { key: "CORS_MAX_AGE", defaultVal: String(DEFAULT_CORS_MAX_AGE) },
+    { key: "READ_REPLICAS_ENABLED", defaultVal: "false" },
+    { key: "REPLICA_ENDPOINTS", defaultVal: "{} (primary only)" },
+    { key: "REPLICA_REGION_ROUTING", defaultVal: "{}" },
+    { key: "REPLICA_LOCAL_REGION", defaultVal: "''" },
+    { key: "REPLICA_MAX_LAG_MS", defaultVal: "5000" },
+    { key: "REPLICA_WARN_LAG_MS", defaultVal: "1000" },
+    { key: "REPLICA_LAG_CHECK_INTERVAL_MS", defaultVal: "10000" },
+    { key: "REPLICA_FAILURE_THRESHOLD", defaultVal: "3" },
+    { key: "REPLICA_RECOVERY_THRESHOLD", defaultVal: "2" },
+    { key: "REPLICA_FAILOVER_TO_PRIMARY", defaultVal: "true" },
+    { key: "REPLICA_READ_AFTER_WRITE_CONSISTENCY", defaultVal: "true" },
+    { key: "REPLICA_CONSISTENCY_WINDOW_MS", defaultVal: "2000" },
+    { key: "JAEGER_ENABLED", defaultVal: "false" },
+    { key: "JAEGER_SERVICE_NAME", defaultVal: "'soroban-identity-server'" },
+    { key: "JAEGER_AGENT_HOST", defaultVal: "'localhost'" },
+    { key: "JAEGER_AGENT_PORT", defaultVal: "6832" },
+    { key: "JAEGER_SAMPLER_TYPE", defaultVal: "'const'" },
+    { key: "JAEGER_SAMPLER_PARAM", defaultVal: "1" },
+    { key: "REQUEST_NONCE_ENABLED", defaultVal: "false" },
+    { key: "REQUEST_NONCE_TTL_SECONDS", defaultVal: "300" },
+    { key: "REQUEST_NONCE_HEADER", defaultVal: "'X-Nonce'" },
+  ];
+
+  for (const item of defaults) {
+    let val;
+    if (item.key === "STELLAR_RPC_URL") {
+      val = env.STELLAR_RPC_URL ?? env.RPC_URL;
+    } else {
+      val = env[item.key];
+    }
+    if (val === undefined || val === "") {
+      logger.info({ variable: item.key, defaultValue: item.defaultVal }, 'Using default config value');
+    }
+  }
+}
