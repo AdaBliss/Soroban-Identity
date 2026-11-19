@@ -134,7 +134,7 @@ function normalizeExpiryTimestamp(expiresAt: number | bigint | string): number {
   return num;
 }
 
-function formatExpiry(expiresAt: number | bigint): string {
+function formatExpiry(expiresAt: number | bigint | string): string {
   const normalized = normalizeExpiryTimestamp(expiresAt);
   if (normalized === 0) return "No expiry";
 
@@ -144,7 +144,6 @@ function formatExpiry(expiresAt: number | bigint): string {
   const diffDays = Math.floor(absSec / (60 * 60 * 24));
   const diffHours = Math.floor(absSec / (60 * 60));
   const diffMinutes = Math.floor(absSec / 60);
-
   if (diffSec < 0) {
     if (diffDays > 0) return `Expired ${diffDays} day${diffDays > 1 ? "s" : ""} ago`;
     if (diffHours > 0) return `Expired ${diffHours} hour${diffHours > 1 ? "s" : ""} ago`;
@@ -157,11 +156,11 @@ function formatExpiry(expiresAt: number | bigint): string {
 }
 
 function getExpiryStyle(expiresAt: number | bigint): React.CSSProperties {
-  const normalized = normalizeExpiryTimestamp(expiresAt);
-  if (normalized === 0) return { color: "var(--text-muted)" };
+  const sec = normalizeExpiryTimestamp(expiresAt);
+  if (sec === 0) return { color: "var(--text-muted)" };
 
   const nowSec = Math.floor(Date.now() / 1000);
-  const diffSec = normalized - nowSec;
+  const diffSec = sec - nowSec;
   const diffDays = Math.floor(Math.abs(diffSec) / (60 * 60 * 24));
 
   if (diffSec < 0) {
@@ -1047,7 +1046,7 @@ export default function CredentialsPanel({ verifyId, wallet: propWallet }: { ver
             nativeToScVal(claimsMap, { type: "map" }),
             nativeToScVal(Buffer.from(claimsHashHex, "hex"), { type: "bytes" }),
             nativeToScVal(Buffer.from(sigHex, "hex"), { type: "bytes" }),
-            nativeToScVal(BigInt(expiresAt.trim() || "0"), { type: "u64" })
+            nativeToScVal(BigInt((expiresAt || "0").trim() || "0"), { type: "u64" })
           )
         )
         .setTimeout(30)
@@ -1410,7 +1409,9 @@ export default function CredentialsPanel({ verifyId, wallet: propWallet }: { ver
                 color: "var(--text-muted)",
                 cursor: "pointer",
                 fontSize: "0.85rem",
+                marginLeft: "auto",
               }}
+              aria-label="Reset Filters"
             >
               Reset Filters
             </button>

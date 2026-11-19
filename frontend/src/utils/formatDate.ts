@@ -39,6 +39,9 @@ export function formatDate(value: string | number | bigint): string {
   }
   const ms = Math.min(unix * 1000, MAX_DATE_MS);
   const date = new Date(ms);
+  if (Number.isNaN(date.getTime())) {
+    return typeof value === 'number' ? `Unix ${normalizeUnixTimestamp(value)}` : String(value);
+  }
   return formatFns(date, 'PPP', { locale: getDateFnsLocale() });
 }
 
