@@ -65,6 +65,65 @@ import {
 } from "./vc-jsonld.js";
 
 /**
+ * Validate the `exp` claim of a JWT bearer token (#1307).
+ *
+ * The signature is verified elsewhere (API key / OAuth validation); this
+ * only guards against a token whose lifetime has elapsed. The payload is
+ * decoded without re-verifying the signature because a token that fails
+ * signature verification never reaches an authenticated route.
+ *
+ * Returns `{ ok: true }` when the token is still valid, otherwise
+ * `{ ok: false, code, message }` describing why it was rejected.
+ */
+export function checkJwtExpiry(token, { clockSkewSeconds = 30, now = Date.now() } = {}) {
+  const parts = String(token).split(".");
+  if (parts.length !== 3) {
+    return { ok: false, code: "INVALID_TOKEN", message: "Malformed JWT bearer token." };
+  }
+
+  let payload;
+  try {
+    const json = Buffer.from(parts[1], "base64url").toString("utf8");
+    payload = JSON.parse(json);
+  } catch {
+    return { ok: false, code: "INVALID_TOKEN", message: "JWT payload could not be decoded." };
+  }
+
+  if (!payload || typeof payload !== "object") {
+    return { ok: false, code: "INVALID_TOKEN", message: "JWT payload could not be decoded." };
+  }
+
+  const exp = payload.exp;
+  if (exp === undefined || exp === null) {
+    return {
+      ok: false,
+      code: "TOKEN_EXPIRY_MISSING",
+      message: "JWT bearer token is missing the required exp claim.",
+    };
+  }
+
+  const expSeconds = Number(exp);
+  if (!Number.isFinite(expSeconds)) {
+    return {
+      ok: false,
+      code: "TOKEN_EXPIRY_INVALID",
+      message: "JWT bearer token has an invalid exp claim.",
+    };
+  }
+
+  const nowSeconds = Math.floor(now / 1000);
+  if (expSeconds + clockSkewSeconds < nowSeconds) {
+    return {
+      ok: false,
+      code: "TOKEN_EXPIRED",
+      message: "JWT bearer token has expired.",
+    };
+  }
+
+  return { ok: true, expiresAt: expSeconds };
+}
+
+/**
  * Whether the caller wants the W3C JSON-LD representation.
  *
  * Accept is the correct mechanism, but a browser address bar cannot set it,
@@ -573,6 +632,34 @@ export function createApp({
         }
       } catch {
         // fallback
+      }
+    }
+
+    // #1307: JWT expiry validation. A bearer token that is a JWT must carry
+    // an `exp` claim that is still in the future (with a small clock-skew
+    // allowance). This runs before routing so every route guarded by
+    // requireAuth — including POST /attestation — rejects expired tokens.
+    // Non-JWT credentials (opaque API keys) are unaffected.
+    const bearerToken = (() => {
+      const header = req.headers["authorization"];
+      if (typeof header !== "string") return null;
+      const match = header.match(/^Bearer\s+(.+)$/i);
+      return match ? match[1].trim() : null;
+    })();
+    if (bearerToken && bearerToken.split(".").length === 3) {
+      const jwtVerdict = checkJwtExpiry(bearerToken, {
+        clockSkewSeconds: config.jwtClockSkewSeconds ?? 30,
+      });
+      if (!jwtVerdict.ok) {
+        logger.warn(
+          { code: jwtVerdict.code, route: routeLabel(pathname) },
+          "Rejected JWT bearer token",
+        );
+        return sendJson(res, 401, {
+          error: "unauthorized",
+          code: jwtVerdict.code,
+          message: jwtVerdict.message,
+        });
       }
     }
     if (req.headers["x-user-tier"]) {

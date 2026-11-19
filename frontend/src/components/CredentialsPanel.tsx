@@ -900,6 +900,11 @@ export default function CredentialsPanel({ verifyId, wallet: propWallet }: { ver
   };
 
   const displayCredentials = fetchedCredentials ?? [];
+  // #1306: `attestations` may be null/undefined or empty when the profile has
+  // no attestations yet. Normalize to an array so downstream code never
+  // dereferences undefined, and short-circuit rendering when it is empty.
+  const attestations: Credential[] = Array.isArray(fetchedCredentials) ? fetchedCredentials : [];
+  const hasAttestations = attestations.length > 0;
 
   // Search narrows the set first; the type/expiry filters then refine it.
   const searchedCredentials = searchResultIds
@@ -1420,7 +1425,7 @@ export default function CredentialsPanel({ verifyId, wallet: propWallet }: { ver
 
         {fetching ? (
           <SkeletonCard variant="credential" />
-        ) : fetchedCredentials !== null && fetchedCredentials.length === 0 ? (
+        ) : fetchedCredentials !== null && !hasAttestations ? (
           <CredentialEmptyState searchedAddress={searchedAddress} />
         ) : sortedCredentials.length === 0 ? (
           <p style={{ color: "var(--text-muted)", fontSize: "0.85rem" }}>
@@ -1431,7 +1436,7 @@ export default function CredentialsPanel({ verifyId, wallet: propWallet }: { ver
         ) : (
           <>
           <ul style={{ listStyle: "none", padding: 0, margin: 0, display: "flex", flexDirection: "column", gap: "0.5rem" }}>
-            {pagedCredentials.map((cred) => {
+            {(pagedCredentials ?? []).map((cred) => {
               const status = getCredentialStatus(cred);
               return (
               <li
@@ -1574,7 +1579,7 @@ export default function CredentialsPanel({ verifyId, wallet: propWallet }: { ver
                         <dd style={{ margin: 0, color: "var(--text)" }}>v{cred.version ?? 1}</dd>
                       </div>
                     </dl>
-                    {Object.keys(cred.claims).length > 0 ? (
+                    {cred.claims && Object.keys(cred.claims).length > 0 ? (
                       <dl style={{ margin: 0, fontSize: "0.85rem" }}>
                         {Object.entries(cred.claims).map(([key, value]) => (
                           <div key={key} style={{ display: "flex", gap: "1rem", marginBottom: "0.5rem" }}>
@@ -2002,6 +2007,14 @@ export default function CredentialsPanel({ verifyId, wallet: propWallet }: { ver
             onClose={() => setShowComparison(false)}
           />
         </Suspense>
+      )}
+
+      {/* #1306: Regression guard — empty attestations must render the empty
+          state rather than crashing on an undefined array access. */}
+      {!fetching && fetchedCredentials !== null && !hasAttestations && (
+        <p role="status" style={{ color: "var(--text-muted)", fontSize: "0.85rem" }}>
+          No attestations available.
+        </p>
       )}
     </>
   );
