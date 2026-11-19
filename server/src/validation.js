@@ -292,6 +292,26 @@ export const schemas = {
   }),
 };
 
+/**
+ * Validate that a decoded JWT payload carries a usable `exp` claim (#1307).
+ *
+ * Returns `false` when `exp` is missing, non-numeric, or already in the past
+ * (accounting for an optional clock-skew allowance in seconds). Tokens without
+ * an expiry must never authenticate.
+ *
+ * @param {unknown} payload Decoded JWT payload.
+ * @param {number} [skewSeconds=0] Allowed clock skew in seconds.
+ * @returns {boolean}
+ */
+export function validateJwtExpiry(payload, skewSeconds = 0) {
+  if (!payload || typeof payload !== 'object') return false;
+  const { exp } = payload;
+  if (typeof exp !== 'number' || !Number.isFinite(exp)) return false;
+  const skew = Number.isFinite(skewSeconds) && skewSeconds > 0 ? skewSeconds : 0;
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  return exp > nowSeconds - skew;
+}
+
 function normalizeInput(input = {}) {
   const normalized = { ...input };
   if (input.query instanceof URLSearchParams) {

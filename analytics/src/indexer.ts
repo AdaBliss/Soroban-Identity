@@ -15,6 +15,8 @@ import type { AnalyticsStore } from "./store";
 
 const EVENT_PAGE_LIMIT = 1000;
 const TX_PAGE_LIMIT = 200;
+/** Safety bound on event pages drained per tick, to avoid infinite loops. */
+const MAX_EVENT_PAGES_PER_TICK = 100;
 /** Cap on resolve_did simulations per tick, to stay polite to the RPC. */
 const COUNTRY_LOOKUPS_PER_TICK = 50;
 
@@ -132,8 +134,10 @@ export class Indexer {
       },
     ];
 
-    // Drain all pages available right now.
-    for (;;) {
+    // Drain all pages available right now. A page is only "done" when it comes
+    // back empty; a short page can still be followed by more pages, so stopping
+    // on `length < EVENT_PAGE_LIMIT` would silently drop the remainder.
+    for (let page = 0; page < MAX_EVENT_PAGES_PER_TICK; page++) {
       const { eventCursor, eventStartLedger } = this.store.data.cursor;
       const request: SorobanRpc.Server.GetEventsRequest = eventCursor
         ? { filters, cursor: eventCursor, limit: EVENT_PAGE_LIMIT }
@@ -151,6 +155,7 @@ export class Indexer {
 
       const last = res.events[res.events.length - 1];
       if (last) {
+        // Persist after every page so a restart resumes from the right position.
         this.store.setCursor({ eventCursor: last.pagingToken, latestLedger: res.latestLedger });
       } else if (!eventCursor) {
         // Nothing yet: advance so the start ledger never ages out of RPC retention.
@@ -159,7 +164,7 @@ export class Indexer {
         this.store.setCursor({ latestLedger: res.latestLedger });
       }
 
-      if (res.events.length < EVENT_PAGE_LIMIT) break;
+      if (res.events.length === 0) break;
     }
   }
 

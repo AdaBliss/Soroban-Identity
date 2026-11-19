@@ -18,6 +18,32 @@ function getDateFnsLocale() {
 const MAX_DATE_MS = 8_640_000_000_000_000; // ECMAScript max Date millisecond value
 const MAX_DATE_SECS = 8_640_000_000_000;
 
+// Stellar ledgers close at a target of one every 5 seconds.
+export const STELLAR_LEDGER_CLOSE_SECONDS = 5;
+// Unix timestamp (seconds) of the Stellar genesis ledger (ledger sequence 1).
+export const STELLAR_GENESIS_UNIX_SECONDS = 1_600_000_000;
+
+/**
+ * Convert a Stellar ledger sequence to a UTC Unix timestamp (in seconds).
+ *
+ * Uses the accurate 5-second-per-ledger close time so the computed expiry
+ * matches the on-chain value (the previous constant was off by ~5s/ledger).
+ * If the caller has the actual ledger close time available it should be
+ * preferred; this helper is the deterministic fallback.
+ */
+export function ledgerSequenceToUnixSeconds(ledgerSequence: number | bigint | string): number {
+  const seq = typeof ledgerSequence === 'bigint' ? Number(ledgerSequence) : Number(ledgerSequence);
+  if (!Number.isFinite(seq) || seq <= 0) return 0;
+  return STELLAR_GENESIS_UNIX_SECONDS + (Math.floor(seq) - 1) * STELLAR_LEDGER_CLOSE_SECONDS;
+}
+
+/**
+ * Convert a Stellar ledger sequence to a UTC Date.
+ */
+export function ledgerSequenceToDate(ledgerSequence: number | bigint | string): Date {
+  return new Date(ledgerSequenceToUnixSeconds(ledgerSequence) * 1000);
+}
+
 export function normalizeUnixTimestamp(value: number | bigint | string): number {
   const num = typeof value === 'bigint' ? Number(value) : typeof value === 'string' ? Number(value) : value;
   if (!Number.isFinite(num) || num <= 0) return 0;
