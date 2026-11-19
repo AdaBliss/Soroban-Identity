@@ -35,8 +35,31 @@ interface ThemeContextValue {
 
 const ThemeContext = createContext<ThemeContextValue | null>(null);
 
+function readPreHydrationDark(): boolean | null {
+  if (typeof document === "undefined") return null;
+  const root = document.documentElement;
+  if (root.classList.contains("dark")) return true;
+  if (root.classList.contains("light")) return false;
+  const attr = root.getAttribute("data-theme");
+  if (attr === "dark") return true;
+  if (attr === "light") return false;
+  return null;
+}
+
 export function ThemeProvider({ children }: { children: ReactNode }) {
   const [themePreference, setThemePreference, isDark] = useThemePreference();
+
+  // Sync the preference hook with the theme already applied by the head script
+  // so the first render matches the pre-hydration theme and no flash occurs.
+  useEffect(() => {
+    const preHydrationDark = readPreHydrationDark();
+    if (preHydrationDark === null) return;
+    if (preHydrationDark !== isDark) {
+      setThemePreference(preHydrationDark ? "dark" : "light");
+    }
+    // Only run once on mount; subsequent changes are handled by the hook.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const [currentTheme, setCurrentTheme] = useState<Theme | null>(() => {
     try {

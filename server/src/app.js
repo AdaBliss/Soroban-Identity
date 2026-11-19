@@ -76,6 +76,7 @@ function wantsJsonLd(req, url) {
   return accept.includes("application/ld+json");
 }
 import { sanitizeDidMetadata, schemas, validateRequest } from "./validation.js";
+import { DidValidationError, validateDidInput } from "./did-validation.js";
 import {
   buildApiRootLinks,
   buildCredentialCollectionLinks,
@@ -1828,55 +1829,91 @@ export function createApp({
         const cacheDidMatch = pathname.match(/^\/cache\/dids\/([^/]+)$/);
         if (req.method === "DELETE" && cacheDidMatch) {
           if (!await requireAuth(req, res, config, ['admin:write'])) return;
-          const did = decodeURIComponent(cacheDidMatch[1]);
+          let rawDid;
+          try {
+            rawDid = decodeURIComponent(cacheDidMatch[1]);
+          } catch {
+            return sendJson(res, 400, { code: "INVALID_DID", message: "Malformed URL-encoded DID parameter." });
+          }
+          const identifierCheck = validateDidInput(rawDid, { field: "did" });
+          if (!identifierCheck.ok) {
+            return sendJson(res, 400, {
+              error: "invalid_did",
+              code: "INVALID_DID",
+              message: identifierCheck.message,
+              details: [{ field: "did", value: rawDid, code: "invalid_did" }],
+            });
+          }
+          const did = identifierCheck.address;
           const invalidated = didCache ? await didCache.invalidate(did) : false;
           return sendJson(res, 200, { did, invalidated });
         }
 
         // ── DID Resolution & Metadata Endpoints (#1067) ────────────────
+        // #1304: malformed DID input must surface as a 400 with a
+        // descriptive message, never as an unhandled exception (500).
         if (req.method === "POST" && (pathname === "/dids" || pathname === "/identity/did")) {
           // These writes land in the DID cache, which resolveDid() reads
           // before the chain, so an unauthenticated write could poison any
           // DID's resolved document.
           if (!await requireAuth(req, res, config, ["admin:write"])) return;
           if (validateContentType(req, res)) return;
-          const body = await readJson(req, config);
-          if (body.__payloadTooLarge) {
-            return sendJson(res, 413, { code: "PAYLOAD_TOO_LARGE", message: "Request body exceeds the size limit." });
+          try {
+            const body = await readJson(req, config);
+            if (body.__payloadTooLarge) {
+              return sendJson(res, 413, { code: "PAYLOAD_TOO_LARGE", message: "Request body exceeds the size limit." });
+            }
+            const validated = validateRequest(res, schemas.upsertDid, { body });
+            if (!validated.ok) return;
+            const rawIdentifier = validated.data.body.did ?? validated.data.body.address ?? "";
+            if (!rawIdentifier) {
+              return sendJson(res, 400, {
+                error: "validation_failed",
+                code: "VALIDATION_FAILED",
+                message: "Either did or address is required.",
+              });
+            }
+            const identifierCheck = validateDidInput(rawIdentifier, { field: "did" });
+            if (!identifierCheck.ok) {
+              return sendJson(res, 400, {
+                error: "invalid_did",
+                code: "INVALID_DID",
+                message: identifierCheck.message,
+                details: [{ field: "did", value: rawIdentifier, code: "invalid_did" }],
+              });
+            }
+            const address = identifierCheck.address;
+            const safeMetadata = sanitizeDidMetadata(body.metadata ?? validated.data.body.metadata ?? {});
+            const nowSec = Math.floor(Date.now() / 1000);
+            const didDoc = {
+              id: `did:stellar:${address}`,
+              controller: validated.data.body.controller ?? `did:stellar:${address}`,
+              createdAt: nowSec,
+              updatedAt: nowSec,
+              metadata: safeMetadata,
+              active: validated.data.body.active !== false,
+            };
+            if (didCache) {
+              await didCache.set(address, didDoc);
+            }
+            const didLinks = buildDidLinks(didDoc, linkPrefix);
+            return sendJson(
+              res,
+              pathname === "/identity/did" ? 200 : 201,
+              { ...didDoc, _links: didLinks },
+              { Link: formatLinkHeader(didLinks) },
+            );
+          } catch (err) {
+            if (err instanceof DidValidationError) {
+              return sendJson(res, 400, {
+                error: "invalid_did",
+                code: "INVALID_DID",
+                message: err.message,
+                details: err.details ?? [],
+              });
+            }
+            throw err;
           }
-          const validated = validateRequest(res, schemas.upsertDid, { body });
-          if (!validated.ok) return;
-          const rawIdentifier = validated.data.body.did ?? validated.data.body.address ?? "";
-          if (!rawIdentifier) {
-            return sendJson(res, 400, {
-              error: "validation_failed",
-              code: "VALIDATION_FAILED",
-              message: "Either did or address is required.",
-            });
-          }
-          const address = rawIdentifier.startsWith("did:stellar:")
-            ? rawIdentifier.slice("did:stellar:".length)
-            : rawIdentifier;
-          const safeMetadata = sanitizeDidMetadata(body.metadata ?? validated.data.body.metadata ?? {});
-          const nowSec = Math.floor(Date.now() / 1000);
-          const didDoc = {
-            id: `did:stellar:${address}`,
-            controller: validated.data.body.controller ?? `did:stellar:${address}`,
-            createdAt: nowSec,
-            updatedAt: nowSec,
-            metadata: safeMetadata,
-            active: validated.data.body.active !== false,
-          };
-          if (didCache) {
-            await didCache.set(address, didDoc);
-          }
-          const didLinks = buildDidLinks(didDoc, linkPrefix);
-          return sendJson(
-            res,
-            pathname === "/identity/did" ? 200 : 201,
-            { ...didDoc, _links: didLinks },
-            { Link: formatLinkHeader(didLinks) },
-          );
         }
 
         const didRouteMatch = pathname.match(/^\/dids\/([^/]+)(\/metadata)?$/);
@@ -1887,63 +1924,84 @@ export function createApp({
           } catch {
             return sendJson(res, 400, { code: "INVALID_DID", message: "Malformed URL-encoded DID parameter." });
           }
-          const address = rawDid.startsWith("did:stellar:") ? rawDid.slice("did:stellar:".length) : rawDid;
-
-          if (req.method === "GET") {
-            const doc = soroban?.resolveDid ? await soroban.resolveDid(address) : null;
-            if (!doc) return notFound(res, req);
-            const didLinks = buildDidLinks(doc, linkPrefix);
-            return sendJson(
-              res,
-              200,
-              {
-                ...doc,
-                metadata: sanitizeDidMetadata(doc.metadata ?? {}),
-                _links: didLinks,
-              },
-              { Link: formatLinkHeader(didLinks) },
-            );
+          const identifierCheck = validateDidInput(rawDid, { field: "did" });
+          if (!identifierCheck.ok) {
+            return sendJson(res, 400, {
+              error: "invalid_did",
+              code: "INVALID_DID",
+              message: identifierCheck.message,
+              details: [{ field: "did", value: rawDid, code: "invalid_did" }],
+            });
           }
+          const address = identifierCheck.address;
 
-          if (req.method === "PUT" || req.method === "PATCH") {
-            // Same cache-poisoning risk as POST /dids above.
-            if (!await requireAuth(req, res, config, ["admin:write"])) return;
-            if (validateContentType(req, res)) return;
-            const body = await readJson(req, config);
-            if (body.__payloadTooLarge) {
-              return sendJson(res, 413, { code: "PAYLOAD_TOO_LARGE", message: "Request body exceeds the size limit." });
+          try {
+            if (req.method === "GET") {
+              const doc = soroban?.resolveDid ? await soroban.resolveDid(address) : null;
+              if (!doc) return notFound(res, req);
+              const didLinks = buildDidLinks(doc, linkPrefix);
+              return sendJson(
+                res,
+                200,
+                {
+                  ...doc,
+                  metadata: sanitizeDidMetadata(doc.metadata ?? {}),
+                  _links: didLinks,
+                },
+                { Link: formatLinkHeader(didLinks) },
+              );
             }
-            const rawMetadata = body.metadata !== undefined ? body.metadata : body;
-            if (!rawMetadata || typeof rawMetadata !== "object" || Array.isArray(rawMetadata)) {
+
+            if (req.method === "PUT" || req.method === "PATCH") {
+              // Same cache-poisoning risk as POST /dids above.
+              if (!await requireAuth(req, res, config, ["admin:write"])) return;
+              if (validateContentType(req, res)) return;
+              const body = await readJson(req, config);
+              if (body.__payloadTooLarge) {
+                return sendJson(res, 413, { code: "PAYLOAD_TOO_LARGE", message: "Request body exceeds the size limit." });
+              }
+              const rawMetadata = body.metadata !== undefined ? body.metadata : body;
+              if (!rawMetadata || typeof rawMetadata !== "object" || Array.isArray(rawMetadata)) {
+                return sendJson(res, 400, {
+                  error: "validation_failed",
+                  code: "VALIDATION_FAILED",
+                  message: "DID metadata must be a JSON object.",
+                });
+              }
+              const safeMetadata = sanitizeDidMetadata(rawMetadata);
+              const existing = (soroban?.resolveDid ? await soroban.resolveDid(address) : null) ?? {
+                id: `did:stellar:${address}`,
+                controller: `did:stellar:${address}`,
+                createdAt: Math.floor(Date.now() / 1000),
+                active: true,
+                metadata: {},
+              };
+              const updatedDoc = {
+                ...existing,
+                updatedAt: Math.floor(Date.now() / 1000),
+                metadata: req.method === "PATCH" ? { ...(existing.metadata ?? {}), ...safeMetadata } : safeMetadata,
+              };
+              if (didCache) {
+                await didCache.set(address, updatedDoc);
+              }
+              const didLinks = buildDidLinks(updatedDoc, linkPrefix);
+              return sendJson(
+                res,
+                200,
+                { ...updatedDoc, _links: didLinks },
+                { Link: formatLinkHeader(didLinks) },
+              );
+            }
+          } catch (err) {
+            if (err instanceof DidValidationError) {
               return sendJson(res, 400, {
-                error: "validation_failed",
-                code: "VALIDATION_FAILED",
-                message: "DID metadata must be a JSON object.",
+                error: "invalid_did",
+                code: "INVALID_DID",
+                message: err.message,
+                details: err.details ?? [],
               });
             }
-            const safeMetadata = sanitizeDidMetadata(rawMetadata);
-            const existing = (soroban?.resolveDid ? await soroban.resolveDid(address) : null) ?? {
-              id: `did:stellar:${address}`,
-              controller: `did:stellar:${address}`,
-              createdAt: Math.floor(Date.now() / 1000),
-              active: true,
-              metadata: {},
-            };
-            const updatedDoc = {
-              ...existing,
-              updatedAt: Math.floor(Date.now() / 1000),
-              metadata: req.method === "PATCH" ? { ...(existing.metadata ?? {}), ...safeMetadata } : safeMetadata,
-            };
-            if (didCache) {
-              await didCache.set(address, updatedDoc);
-            }
-            const didLinks = buildDidLinks(updatedDoc, linkPrefix);
-            return sendJson(
-              res,
-              200,
-              { ...updatedDoc, _links: didLinks },
-              { Link: formatLinkHeader(didLinks) },
-            );
+            throw err;
           }
         }
 

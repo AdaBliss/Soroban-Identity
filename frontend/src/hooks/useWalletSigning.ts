@@ -49,14 +49,22 @@ export function useWalletSigning({
   wcTopicRef,
 }: UseWalletSigningOptions) {
   const [signingError, setSigningError] = useState<string | null>(null);
+  // Set to `true` whenever the most recent attempt was rejected by the user.
+  // Callers must rebuild the transaction (fresh XDR) before retrying rather
+  // than resubmitting the previously rejected XDR, which would broadcast a
+  // duplicate transaction.
+  const [signingRejected, setSigningRejected] = useState(false);
 
   const signTransaction = useCallback(
     async (xdr: string): Promise<string> => {
       if (!state.connected) throw new Error("Wallet not connected");
 
-      // Clear any previous rejection message before each attempt.
+      // Clear any previous rejection message/flag before each attempt so a
+      // stale rejection never leaks into a new signing flow.
       setSigningError(null);
+      setSigningRejected(false);
       setState((s) => ({ ...s, txLoading: true }));
+======
 
       try {
         if (state.walletType === "walletconnect") {
@@ -89,6 +97,9 @@ export function useWalletSigning({
           if (isUserRejection(freighterErr)) {
             // User cancelled — surface a friendly message, keep the panel alive.
             setSigningError("Transaction signing was cancelled.");
+            // Mark the attempt as rejected so callers know they must rebuild
+            // the transaction instead of resubmitting the old XDR.
+            setSigningRejected(true);
             // Return a rejected promise so the caller knows signing did not
             // complete, but do NOT re-throw so the ErrorBoundary is bypassed.
             return Promise.reject(new Error("Transaction signing was cancelled."));
@@ -96,6 +107,7 @@ export function useWalletSigning({
           // Genuine Freighter error — re-throw so callers can handle it.
           throw freighterErr;
         }
+======
       } finally {
         setState((s) => ({ ...s, txLoading: false }));
       }
@@ -111,5 +123,15 @@ export function useWalletSigning({
     ]
   );
 
-  return { signTransaction, signingError, clearSigningError: () => setSigningError(null) };
+  const clearSigningError = useCallback(() => {
+    setSigningError(null);
+    setSigningRejected(false);
+  }, []);
+
+  return {
+    signTransaction,
+    signingError,
+    signingRejected,
+    clearSigningError,
+  };
 }

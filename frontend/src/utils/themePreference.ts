@@ -31,6 +31,24 @@ export function getSystemThemeQuery(): MediaQueryList | null {
   }
 }
 
+/**
+ * Read the theme preference and resolved dark state already applied to the
+ * document by the inline head script. Returns null when nothing has been
+ * applied yet (e.g. server rendering or a non-browser environment).
+ */
+export function readAppliedThemePreference(): { preference: ThemePreference; dark: boolean } | null {
+  if (typeof document === 'undefined') return null;
+  const html = document.documentElement;
+  const rawPreference = html.getAttribute('data-theme-preference');
+  const preference: ThemePreference =
+    rawPreference === 'light' || rawPreference === 'dark' || rawPreference === 'system'
+      ? rawPreference
+      : 'system';
+  const appliedTheme = html.getAttribute('data-theme');
+  if (appliedTheme !== 'dark' && appliedTheme !== 'light') return null;
+  return { preference, dark: appliedTheme === 'dark' };
+}
+
 export function applyThemePreference(preference: ThemePreference, systemDark: boolean): void {
   if (typeof document === 'undefined') return;
   const dark = preference === 'dark' || (preference === 'system' && systemDark);
@@ -44,6 +62,7 @@ export function applyThemePreference(preference: ThemePreference, systemDark: bo
 
 /** Run before mounting React, using the same preference as the hook/provider. */
 export function initializeTheme(): void {
+  if (typeof document === 'undefined') return;
   const preference = readThemePreference();
   const systemDark = getSystemThemeQuery()?.matches ?? false;
   const dark = preference === 'dark' || (preference === 'system' && systemDark);
@@ -52,5 +71,9 @@ export function initializeTheme(): void {
     applyTheme({ ...customTheme, mode: dark ? 'dark' : 'light' });
     document.documentElement.setAttribute('data-custom-theme', 'true');
   }
+  // The inline head script may have already applied the same state; skip the
+  // redundant DOM writes so initialization stays idempotent and flash-free.
+  const applied = readAppliedThemePreference();
+  if (applied && applied.preference === preference && applied.dark === dark) return;
   applyThemePreference(preference, systemDark);
 }

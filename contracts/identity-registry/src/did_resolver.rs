@@ -48,6 +48,7 @@ pub enum DidResolverError {
     UnsupportedDidMethod,
     MalformedDid,
     DidMethodAlreadyRegistered,
+    NotFound,
 }
 
 /// Storage keys for the DID resolver.
@@ -72,11 +73,11 @@ impl DidResolver {
             .set(&DidResolverKey::Admin, &admin);
     }
 
-    fn admin(env: &Env) -> Address {
+    fn admin(env: &Env) -> Result<Address, DidResolverError> {
         env.storage()
             .persistent()
             .get(&DidResolverKey::Admin)
-            .expect("not initialized")
+            .ok_or(DidResolverError::NotFound)
     }
 
     /// Register a custom DID method. Admin-gated.
@@ -87,7 +88,7 @@ impl DidResolver {
         handler: Symbol,
     ) -> Result<(), DidResolverError> {
         caller.require_auth();
-        let admin = Self::admin(env);
+        let admin = Self::admin(env)?;
         if caller != admin {
             return Err(DidResolverError::UnsupportedDidMethod);
         }
@@ -199,6 +200,9 @@ impl DidResolver {
     ) -> Result<DidDocument, DidResolverError> {
         // The id is expected to be a Stellar address string.
         let address_str = id.to_string();
+        if address_str.is_empty() {
+            return Err(DidResolverError::MalformedDid);
+        }
         let address = Address::from_string(&String::from_slice(env, &address_str));
 
         let mut vms: Vec<VerificationMethod> = Vec::new(env);
@@ -425,6 +429,26 @@ mod tests {
         let did = String::from_slice(&env, "did:unknown:12345");
         let res = DidResolver::resolve_did(&env, did);
         assert_eq!(res, Err(DidResolverError::UnsupportedDidMethod));
+    }
+
+    #[test]
+    fn test_unknown_did_does_not_panic() {
+        let (env, _admin) = setup();
+        let did = String::from_slice(&env, "did:unknown:12345");
+        // Must return an Err rather than panicking.
+        let res = DidResolver::resolve_did(&env, did);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_uninitialized_admin_returns_err() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let caller = Address::generate(&env);
+        let method = Symbol::new(&env, "example");
+        let handler = Symbol::new(&env, "example_handler");
+        let res = DidResolver::register_did_method(&env, caller, method, handler);
+        assert_eq!(res, Err(DidResolverError::NotFound));
     }
 
     #[test]

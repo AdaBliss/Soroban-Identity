@@ -77,6 +77,9 @@ pub trait IdentityRegistryInterface {
     /// Resolve a DID through the universal resolver, dispatching to the
     /// appropriate method-specific resolver (`did:stellar`, `did:ethr`,
     /// `did:web`, or a registered custom plugin) with caching and fallback.
+    ///
+    /// Returns `Err(ContractError::DidNotFound)` (rather than panicking) when
+    /// the DID is unknown or cannot be resolved by any configured resolver.
     fn resolve_did_universal(env: Env, did: String) -> Result<DidDocument, ContractError>;
 
     /// Register a custom resolver plugin for a DID method.
@@ -94,6 +97,9 @@ pub trait IdentityRegistryInterface {
     ) -> Result<(), ContractError>;
 
     /// Fetch a previously cached resolved DID document, if present.
+    ///
+    /// Returns `Err(ContractError::DidNotFound)` (rather than panicking) when
+    /// no cached document exists for the given DID.
     fn get_cached_did(env: Env, did: String) -> Result<DidDocument, ContractError>;
 
     /// Validate a DID document against the resolver's structural rules.
@@ -105,6 +111,10 @@ pub trait IdentityRegistryInterface {
         method: DidMethod,
     ) -> Result<(), ContractError>;
 
+    /// Resolve a DID string to its document.
+    ///
+    /// Returns `Err(ContractError::DidNotFound)` (rather than panicking) when
+    /// the DID is unknown or cannot be resolved.
     fn resolve_did_string(env: Env, did: String) -> Result<DidDocument, ContractError>;
 
     fn get_did_methods(env: Env, controller: Address) -> Result<Vec<DidMethod>, ContractError>;

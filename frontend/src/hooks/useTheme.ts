@@ -18,9 +18,30 @@ export type { ThemePreference } from '../utils/themePreference';
  * - setTheme: Function to update the theme preference
  * - isDarkMode: Boolean indicating if dark mode is active (considering system preference)
  */
+function readPreAppliedPreference(): ThemePreference | null {
+  if (typeof document === 'undefined') return null;
+  const attr = document.documentElement.getAttribute('data-theme-preference');
+  if (attr === 'light' || attr === 'dark' || attr === 'system') return attr;
+  return null;
+}
+
+function readPreAppliedDark(): boolean | null {
+  if (typeof document === 'undefined') return null;
+  const cls = document.documentElement.classList;
+  if (cls.contains('dark')) return true;
+  if (cls.contains('light')) return false;
+  return null;
+}
+
 export function useTheme(): [ThemePreference, (theme: ThemePreference) => void, boolean] {
-  const [theme, setThemeState] = useState<ThemePreference>(readThemePreference);
-  const [systemDark, setSystemDark] = useState(() => getSystemThemeQuery()?.matches ?? false);
+  const [theme, setThemeState] = useState<ThemePreference>(
+    () => readPreAppliedPreference() ?? readThemePreference(),
+  );
+  const [systemDark, setSystemDark] = useState(() => {
+    const preApplied = readPreAppliedDark();
+    if (preApplied !== null) return preApplied;
+    return getSystemThemeQuery()?.matches ?? false;
+  });
   const isDarkMode = theme === 'dark' || (theme === 'system' && systemDark);
 
   // App and ThemeProvider both consume this hook. Keep them (and other tabs)
