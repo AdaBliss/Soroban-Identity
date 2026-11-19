@@ -73,6 +73,14 @@ function formatAttributeLabel(key: string): string {
     .trim();
 }
 
+const DEFAULT_NOTIFICATIONS_PREFERENCES = {
+  enabled: true,
+  email: true,
+  push: false,
+  disclosureAlerts: true,
+  verifierRequests: true,
+};
+
 function createDefaultSettings(): PrivacySettingsModel {
   return {
     visibility: 'private',
@@ -84,6 +92,7 @@ function createDefaultSettings(): PrivacySettingsModel {
     })),
     trustedVerifiers: [],
     sharingLinks: [],
+    notifications: { ...DEFAULT_NOTIFICATIONS_PREFERENCES },
   };
 }
 
@@ -145,6 +154,10 @@ const PrivacySettings: React.FC<PrivacySettingsProps> = ({
             attributes: mergedAttributes,
             trustedVerifiers: stored.trustedVerifiers ?? [],
             sharingLinks: stored.sharingLinks ?? [],
+            notifications: {
+              ...DEFAULT_NOTIFICATIONS_PREFERENCES,
+              ...(stored.notifications ?? {}),
+            },
           });
         } else {
           setSettings((prev) => ({
@@ -255,6 +268,7 @@ const PrivacySettings: React.FC<PrivacySettingsProps> = ({
   };
 
   const disclosedCount = settings.attributes.filter((a) => a.disclosed).length;
+  const notifications = settings.notifications ?? DEFAULT_NOTIFICATIONS_PREFERENCES;
 
   return (
     <section className="privacy-settings" aria-labelledby="privacy-settings-heading">
@@ -412,6 +426,73 @@ const PrivacySettings: React.FC<PrivacySettingsProps> = ({
               {verifierError}
             </p>
           ) : null}
+        </div>
+      </fieldset>
+
+      <fieldset className="privacy-settings__notifications">
+        <legend>Notifications</legend>
+        <p className="privacy-settings__hint">
+          Control how you are notified about privacy and disclosure activity.
+        </p>
+        <div className="privacy-settings__option">
+          <input
+            type="checkbox"
+            id="notifications-enabled"
+            checked={notifications.enabled ?? true}
+            onChange={(e) => {
+              const next: PrivacySettingsModel = {
+                ...settings,
+                notifications: { ...notifications, enabled: e.target.checked },
+              };
+              void persist(
+                next,
+                'notifications-changed',
+                `Notifications ${e.target.checked ? 'enabled' : 'disabled'}.`,
+              );
+            }}
+            disabled={loading}
+          />
+          <label htmlFor="notifications-enabled">Enable notifications</label>
+        </div>
+        <div className="privacy-settings__option">
+          <input
+            type="checkbox"
+            id="notifications-disclosure-alerts"
+            checked={notifications.disclosureAlerts ?? true}
+            onChange={(e) => {
+              const next: PrivacySettingsModel = {
+                ...settings,
+                notifications: { ...notifications, disclosureAlerts: e.target.checked },
+              };
+              void persist(
+                next,
+                'notifications-changed',
+                `Disclosure alerts ${e.target.checked ? 'enabled' : 'disabled'}.`,
+              );
+            }}
+            disabled={loading || !(notifications.enabled ?? true)}
+          />
+          <label htmlFor="notifications-disclosure-alerts">Alert me on attribute disclosure</label>
+        </div>
+        <div className="privacy-settings__option">
+          <input
+            type="checkbox"
+            id="notifications-verifier-requests"
+            checked={notifications.verifierRequests ?? true}
+            onChange={(e) => {
+              const next: PrivacySettingsModel = {
+                ...settings,
+                notifications: { ...notifications, verifierRequests: e.target.checked },
+              };
+              void persist(
+                next,
+                'notifications-changed',
+                `Verifier request notifications ${e.target.checked ? 'enabled' : 'disabled'}.`,
+              );
+            }}
+            disabled={loading || !(notifications.enabled ?? true)}
+          />
+          <label htmlFor="notifications-verifier-requests">Notify me of verifier requests</label>
         </div>
       </fieldset>
 
