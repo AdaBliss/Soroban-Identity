@@ -267,7 +267,13 @@ export class SorobanClient {
         if (!response.ok) throw new Error(`RPC getEvents failed with HTTP ${response.status}`);
         const payload = await response.json();
         if (payload.error) throw new Error(payload.error.message ?? 'RPC getEvents failed');
-        return payload.result?.events ?? [];
+        // Stamp events with a UTC ISO-8601 timestamp. Never derive timestamps
+        // from local server time; all DB timestamps must be UTC (#1325).
+        const observedAt = new Date().toISOString();
+        return (payload.result?.events ?? []).map((event) => ({
+          ...event,
+          observedAt,
+        }));
       } finally {
         this.metrics?.observeRpcLatency((performance.now() - started) / 1000);
       }
@@ -277,6 +283,17 @@ export class SorobanClient {
       }
       throw error;
     });
+  }
+
+  /**
+   * Connection options for any DB handle opened on behalf of the indexer.
+   *
+   * The indexer must never write local-time timestamps, so the session
+   * timezone is forced to UTC regardless of the server's local timezone
+   * (#1325). Consumers spread this into their connection/pool options.
+   */
+  getDbConnectionOptions() {
+    return { timezone: this.config?.dbTimezone ?? 'UTC' };
   }
 
   /** Gracefully drain the worker pool before shutdown. */

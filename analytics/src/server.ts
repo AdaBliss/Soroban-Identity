@@ -1,3 +1,7 @@
+// Force UTC for all date handling in this process (indexer + formatting),
+// regardless of the host's local timezone. Must run before any Date usage.
+if (!process.env.TZ) process.env.TZ = "UTC";
+
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";

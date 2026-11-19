@@ -1,5 +1,6 @@
 import type { Credential } from '../../../sdk/src/types';
 import { trackShareEvent } from './credentialCrypto';
+import { copyToClipboard } from './clipboard';
 
 export type SocialPlatform = 'twitter' | 'linkedin' | 'facebook' | 'whatsapp' | 'native' | 'copy';
 
@@ -192,6 +193,24 @@ export function trackSocialShare(
     credentialType: privacy.includeType ? credential.credentialType : undefined,
     credentialId: privacy.includeIdInAnalytics ? credential.id : undefined,
   });
+}
+
+/**
+ * Copy a share URL to the clipboard. Uses the shared `copyToClipboard`
+ * helper so it falls back to `document.execCommand` in non-secure contexts
+ * (e.g. plain-HTTP dev environments) where `navigator.clipboard` is absent.
+ * The share event is only recorded when the copy actually succeeds.
+ */
+export async function copyShareUrl(
+  url: string,
+  credential: Pick<Credential, 'id' | 'credentialType'>,
+  privacy: SharePrivacyOptions
+): Promise<boolean> {
+  const copied = await copyToClipboard(url);
+  if (copied) {
+    trackSocialShare('copy', credential, privacy);
+  }
+  return copied;
 }
 
 /** Summarize locally recorded social share events by platform. */
