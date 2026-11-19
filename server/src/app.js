@@ -47,7 +47,16 @@ import {
   validateContentType,
 } from "./http-utils.js";
 import { KEY_ID_HEADER, NonceStore, verifySignedRequest } from "./request-signing.js";
-import { createNonceStore, nonceMiddleware } from "./middleware/nonce.js";
+import {
+  ENCRYPTION_ENABLED_HEADER,
+  ENCRYPTION_KEY_ID_HEADER,
+  SessionKeyRegistry,
+  decryptSensitiveRequestFields,
+  encryptSensitiveResponseFields,
+  isEncryptionEnabled,
+  negotiateSessionKey,
+  wrapResponseEncryption,
+} from "./response-encryption.js";
 import { normalizeCspReports, setSecurityHeaders } from "./security-headers.js";
 import {
   CREDENTIAL_STATUS_TYPE,
@@ -86,7 +95,12 @@ import { logger } from "./logger.js";
 import { AnalyticsService, detectCountry } from "./analytics.js";
 import { createRateLimiter } from "./middleware/ratelimit.js";
 import { ApiKeyService } from "./api-keys.js";
-import { OAuthService } from "./oauth.js";
+import { OAuthService, OAuthError } from "./oauth.js";
+import { computeEtag, matchesIfNoneMatch, matchesIfMatch } from "./etag.js";
+import { applyFieldFiltering } from "./field-filter.js";
+import { createCompressionMiddleware } from "./compression.js";
+import { executeBatch } from "./batch.js";
+import { readNotificationLog, summarizeNotificationLog } from "./notification-log.js";
 import { UsageTracker } from "./analytics/usage.js";
 import { EmailTransport } from "./email.js";
 import { pickQuotaBinding, QuotaTracker, notifyQuotaThresholdOwner } from "./quota.js";
@@ -97,6 +111,9 @@ import { openTelemetryHttpMiddleware } from "./tracing/index.js";
 import { EventStore, EventReplayer, createEvent, EventTypes, handleEventSourcingRoutes } from "./events/index.js";
 import { handleMockApiRequest } from "./mock-api.js";
 import { collectHealth, collectReadiness } from "./health.js";
+import { CacheManager, CACHE_TTL, cacheKey } from "./cache/index.js";
+import { MeteringService, meteringMiddleware, handleBillingRoutes } from "./billing/index.js";
+import { createRequestDeduplication } from "./middleware/dedupe.js";
 const SERVER_VERSION = "0.1.0";
 const MIN_SDK_VERSION = "0.1.0";
 const SERVER_FEATURES = [
@@ -111,6 +128,25 @@ const SERVER_FEATURES = [
   "job_queue",
   "graceful_shutdown",
   "hateoas",
+  "multi_layer_cache",
+  "usage_metering",
+  "billing",
+];
+
+/** Top-level fields selectable via `?fields=` on a credential resource. */
+const CREDENTIAL_FIELDS = [
+  "id",
+  "subject",
+  "issuer",
+  "type",
+  "claims",
+  "expiresAt",
+  "expires_at",
+  "issuedAt",
+  "issued_at",
+  "revoked",
+  "revokedAt",
+  "metadata",
 ];
 
 const usageTracker = new UsageTracker();
@@ -142,6 +178,8 @@ export function createApp({
   deprecationRegistry = null,
   ddosProtection = null,
   sessionKeyRegistry = null,
+  cacheManager = null,
+  meteringService = null,
 }) {
   // Expose the key service on config so http-utils.requireAuth can validate
   // issued API keys instead of falling back to the single admin key.
@@ -199,11 +237,13 @@ export function createApp({
   // sessions that were using them.
   const encryptionKeys =
     sessionKeyRegistry ??
-    new SessionKeyRegistry({
-      ttlSeconds: config.encryptionSessionKeyTtlSeconds,
-      rotationSeconds: config.encryptionKeyRotationSeconds,
-      maxKeys: config.encryptionMaxSessionKeys,
-    });
+    (isEncryptionEnabled(config)
+      ? new SessionKeyRegistry({
+          ttlSeconds: config.encryptionSessionKeyTtlSeconds,
+          rotationSeconds: config.encryptionKeyRotationSeconds,
+          maxKeys: config.encryptionMaxSessionKeys,
+        })
+      : null);
 
   const tenantRegistry = new TenantRegistry(config);
   void tenantRegistry.init();
@@ -213,20 +253,71 @@ export function createApp({
   // instances; falls back to an in-process store otherwise.
   const replayStore =
     replayNonceStore ??
-    createNonceStore({
-      redisClient,
-      ttlSeconds: config.nonceTtlSeconds ?? 300,
-      metrics,
-    });
-  const checkNonce = nonceMiddleware({
-    store: replayStore,
-    ttlSeconds: config.nonceTtlSeconds ?? 300,
-    metrics,
-  });
+    new NonceStore({ ttlSeconds: config.nonceTtlSeconds ?? 300 });
+  const checkNonce = async (req, res) => {
+    const nonce = req.headers["x-nonce"] ?? req.headers["x-request-nonce"] ?? null;
+    if (!nonce) {
+      return {
+        ok: false,
+        status: 400,
+        code: "MISSING_NONCE",
+        reason: "missing",
+        message: "A request nonce is required for state-changing requests.",
+      };
+    }
+    const accepted = await replayStore.consume(nonce, { scope: req.apiKeyId ?? "" });
+    if (!accepted) {
+      return {
+        ok: false,
+        status: 409,
+        code: "SIGNATURE_REPLAYED",
+        reason: "replayed",
+        message: "Request nonce has already been used.",
+      };
+    }
+    return { ok: true, serverNonce: crypto.randomUUID() };
+  };
 
   const eventStore = new EventStore({ dataDir: `${config.dataDir}/events` });
   void eventStore.init();
   const eventReplayer = new EventReplayer(eventStore);
+
+  // #1118: multi-layer caching strategy. L1 is in-memory (LRU), L2 is Redis
+  // when available, L3 is CDN via response headers. The manager owns the
+  // warming scheduler and the invalidation pipeline.
+  const cache =
+    cacheManager ??
+    new CacheManager({
+      config,
+      redisClient,
+      metrics,
+      logger,
+    });
+  // Start the warming scheduler (no-op when disabled in config).
+  if (typeof cache.startWarming === "function") {
+    try {
+      cache.startWarming();
+    } catch (error) {
+      logger.warn({ error: error.message }, "Failed to start cache warming scheduler");
+    }
+  }
+
+  // #1119: API usage metering and billing. The service tracks per-endpoint
+  // calls, enforces quotas, and generates invoices. When no service is
+  // supplied it is created from config so the routes always exist.
+  const metering =
+    meteringService ??
+    new MeteringService({
+      config,
+      apiKeyService,
+      emailTransport,
+      logger,
+      metrics,
+    });
+  const meter = meteringMiddleware({ service: metering, config });
+  const dedupe = createRequestDeduplication({
+    ttlMs: config.requestDeduplicationTtlMs ?? 5000,
+  });
 
   return async function app(req, res) {
     const startTime = Date.now();
@@ -272,6 +363,10 @@ export function createApp({
     // metrics endpoint, carries X-Correlation-ID.
     const correlationId = correlationMiddleware(req, res, { path: pathname });
     const requestId = correlationId;
+
+    // #1118: attach the cache manager to the request so handlers can read
+    // through it without threading it through every call site.
+    req.cache = cache;
 
     const handler = async () => {
     // Distributed Tracing with OpenTelemetry (#801)
@@ -542,7 +637,7 @@ export function createApp({
           ? await apiKeyService.getSigningSecret(signingKeyId)
           : null;
 
-        const verdict = verifySignedRequest({
+        const verdict = await verifySignedRequest({
           headers: req.headers,
           method: req.method,
           path: req.url,
@@ -647,7 +742,7 @@ export function createApp({
 
     // #1053: resolve the tenant before quota/limit checks so per-tenant
     // budgets apply. The tenant registry is the source of truth for limits.
-    const tenant = tenantRegistry.get(tenantId) ?? null;
+    const tenant = tenantRegistry.getTenant(tenantId) ?? null;
     req.tenant = tenant;
     if (tenant) {
       const tenantLimits = tenant.limits ?? {};
@@ -712,22 +807,31 @@ export function createApp({
       }
     }
 
-        if (req.method === "GET" && pathname === "/info") {
-          return sendJson(res, 200, {
-            version: SERVER_VERSION,
-            apiVersion: version,
-            supportedVersions: SUPPORTED_VERSIONS,
-            features: SERVER_FEATURES,
-            minSdkVersion: MIN_SDK_VERSION,
-            encryption: {
-              enabled: isEncryptionEnabled(config),
-              algorithm: "aes-256-gcm",
-              keyExchange: "/encryption/session",
-              rotation: "/encryption/rotate",
-              keyIdHeader: ENCRYPTION_KEY_ID_HEADER,
-              encryptedFields: ["claims", "subject", "credentialSubject"],
+        const linkPrefix = resolveLinkPrefix({ version, isExplicitUrlVersion });
+
+        if (req.method === "GET" && (pathname === "/" || pathname === "/info")) {
+          const rootLinks = buildApiRootLinks(linkPrefix);
+          return sendJson(
+            res,
+            200,
+            {
+              version: SERVER_VERSION,
+              apiVersion: version,
+              supportedVersions: SUPPORTED_VERSIONS,
+              features: SERVER_FEATURES,
+              minSdkVersion: MIN_SDK_VERSION,
+              encryption: {
+                enabled: isEncryptionEnabled(config),
+                algorithm: "aes-256-gcm",
+                keyExchange: "/encryption/session",
+                rotation: "/encryption/rotate",
+                keyIdHeader: ENCRYPTION_KEY_ID_HEADER,
+                encryptedFields: ["claims", "subject", "credentialSubject"],
+              },
+              _links: rootLinks,
             },
-          });
+            { Link: formatLinkHeader(rootLinks) },
+          );
         }
 
         // CSP violation reports (#754). Unauthenticated by necessity — the
@@ -799,9 +903,6 @@ export function createApp({
           });
         }
 
-        if (req.method === 'GET' && url.pathname === '/metrics') {
-          if (metricsAggregator) await metricsAggregator.refresh().catch((error) => logger.error('metrics refresh failed', error));
-          return sendText(res, 200, metrics.renderPrometheus());
         if (req.method === "GET" && pathname === "/ready") {
           const readiness = await collectReadiness({
             config,
@@ -1169,30 +1270,20 @@ export function createApp({
           const recordVerification = (result) =>
             metrics?.observeCredentialVerification?.(result);
           if (!credential) {
+            recordVerification("not_found");
             return sendFormatted(req, res, 200, { verified: false, reason: "not_found" });
           }
           if (credential.revoked) {
+            recordVerification("revoked");
             return sendFormatted(req, res, 200, { verified: false, reason: "revoked" });
           }
           const now = Math.floor(Date.now() / 1000);
           if (credential.expiresAt > 0 && credential.expiresAt < now) {
+            recordVerification("expired");
             return sendFormatted(req, res, 200, { verified: false, reason: "expired" });
           }
-          return sendFormatted(req, res, 200, { verified: true, credential });
-            recordVerification("not_found");
-            return sendJson(res, 200, { verified: false, reason: "not_found" });
-          }
-          if (credential.revoked) {
-            recordVerification("revoked");
-            return sendJson(res, 200, { verified: false, reason: "revoked" });
-          }
-          const now = Math.floor(Date.now() / 1000);
-          if (credential.expiresAt > 0 && credential.expiresAt < now) {
-            recordVerification("expired");
-            return sendJson(res, 200, { verified: false, reason: "expired" });
-          }
           recordVerification("verified");
-          return sendJson(res, 200, { verified: true, credential });
+          return sendFormatted(req, res, 200, { verified: true, credential });
         }
 
         // Interactive Swagger UI (#830)
@@ -1586,6 +1677,7 @@ export function createApp({
           if (!await requireAuth(req, res, config, ['admin:read'])) return;
           const validated = validateRequest(res, schemas.webhookLogsQuery, { query: url.searchParams });
           if (!validated.ok) return;
+          const limit = validated.data.query.limit ?? 50;
           const webhookId = validated.data.query.webhookId ?? null;
           const allLogs = await readWebhookLogs(config, { webhookId, limit: null });
           const { items: logs, pagination } = offsetPage(allLogs, {
@@ -1635,6 +1727,10 @@ export function createApp({
 
         // ── DID Resolution & Metadata Endpoints (#1067) ────────────────
         if (req.method === "POST" && (pathname === "/dids" || pathname === "/identity/did")) {
+          // These writes land in the DID cache, which resolveDid() reads
+          // before the chain, so an unauthenticated write could poison any
+          // DID's resolved document.
+          if (!await requireAuth(req, res, config, ["admin:write"])) return;
           if (validateContentType(req, res)) return;
           const body = await readJson(req, config);
           if (body.__payloadTooLarge) {
@@ -1702,6 +1798,8 @@ export function createApp({
           }
 
           if (req.method === "PUT" || req.method === "PATCH") {
+            // Same cache-poisoning risk as POST /dids above.
+            if (!await requireAuth(req, res, config, ["admin:write"])) return;
             if (validateContentType(req, res)) return;
             const body = await readJson(req, config);
             if (body.__payloadTooLarge) {
@@ -1898,7 +1996,6 @@ export function createApp({
           return sendFormatted(req, res, 200, { ...report, pagination });
         }
 
-        return notFound(res, req);
         if (req.method === "GET" && (url.pathname === "/admin/expiry-thresholds" || url.pathname === "/expiry/thresholds")) {
           if (!await requireAuth(req, res, config, ['admin:read'])) return;
           return sendJson(res, 200, {
@@ -2213,7 +2310,7 @@ export function createApp({
 
         return notFound(res);
     };
-    return requestContextStore.run({ requestId, correlationId, tenantId }, handler).catch((error) => {
+    return dedupe(req, res, () => requestContextStore.run({ requestId, correlationId, tenantId }, handler), config).catch((error) => {
         if (error.name === "SorobanError" || error.name === "SorobanUnavailableError") {
           const isUnavailable = error.name === "SorobanUnavailableError" || error.category === "rpc_unavailable";
           const statusCode = isUnavailable ? 503 : 500;

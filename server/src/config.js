@@ -3,6 +3,38 @@ import { logger } from './logger.js';
 import { parseCronExpression } from './cron.js';
 
 const DEFAULT_DATA_DIR = path.resolve(process.cwd(), "data");
+// Defaults used by the optional session-key encryption feature. The sensitive
+// field list remains empty so deployments must opt in to fields explicitly.
+const DEFAULT_ENCRYPTION_KEY_ROTATION_SECONDS = 900;
+const DEFAULT_ENCRYPTION_SESSION_TTL_SECONDS = 24 * 60 * 60;
+const DEFAULT_ENCRYPTION_SENSITIVE_FIELDS = [];
+
+// #1325 BUG-28: all DB timestamps must be UTC. The indexer previously stored
+// timestamps in the server's local timezone. The DB connection layer applies
+// this timezone to every session; it defaults to UTC so a deployment that does
+// not set DB_TIMEZONE still gets UTC timestamps.
+const DEFAULT_DB_TIMEZONE = "UTC";
+
+/**
+ * Resolve the database session timezone from the environment.
+ *
+ * @param {Object} env - Environment variable object
+ * @returns {string} The configured timezone, or "UTC" when unset/blank
+ */
+export function resolveDbTimezone(env = process.env) {
+  const raw = env.DB_TIMEZONE;
+  if (raw === undefined || raw === null) return DEFAULT_DB_TIMEZONE;
+  const trimmed = String(raw).trim();
+  return trimmed === "" ? DEFAULT_DB_TIMEZONE : trimmed;
+}
+
+// Force the process timezone to UTC at module load when the DB timezone is
+// UTC, so any Date/DB session defaults that fall back to the process timezone
+// also produce UTC timestamps. This runs before any other module reads TZ.
+const initialDbTimezone = resolveDbTimezone(process.env);
+if (initialDbTimezone.toUpperCase() === "UTC") {
+  process.env.TZ = "UTC";
+}
 
 /**
  * Parse an integer from a string environment variable value.
@@ -247,6 +279,14 @@ export function loadConfig(env = process.env) {
     mockApiEnabled: nodeEnv !== "production" && parseBoolean(env.MOCK_API_ENABLED, false),
     port: parseInteger(env.PORT, 3001),
     adminApiKey: env.ADMIN_API_KEY ?? "",
+    adminIpAllowlist: parseList(env.ADMIN_IP_ALLOWLIST, []),
+    // Production admin routes are unavailable until an explicit allowlist is
+    // supplied. Set ADMIN_IP_ALLOWLIST_REQUIRED=false only for a deliberate
+    // migration window; a configured list is always enforced.
+    adminIpAllowlistRequired: parseBoolean(
+      env.ADMIN_IP_ALLOWLIST_REQUIRED,
+      nodeEnv === "production",
+    ),
     adminActor: env.ADMIN_ACTOR ?? "admin",
     corsAllowedOrigins: parseCorsOrigins(
       env.CORS_ORIGIN ?? env.CORS_ALLOWED_ORIGINS,
@@ -383,6 +423,79 @@ export function loadConfig(env = process.env) {
       .split(",")
       .map((entry) => entry.trim())
       .filter(Boolean),
+    // Multi-layer caching strategy (#1118).
+    // L1: in-process LRU cache. CACHE_L1_MAX_ENTRIES=0 disables L1.
+    cacheL1Enabled: parseBoolean(env.CACHE_L1_ENABLED, true),
+    cacheL1MaxEntries: parseInteger(env.CACHE_L1_MAX_ENTRIES, 1000, true),
+    cacheL1DefaultTtlMs: parseInteger(env.CACHE_L1_DEFAULT_TTL_MS, 30_000),
+    // L2: Redis-backed shared cache. TTLs are per data type so volatile data
+    // (e.g. balances) is not held as long as stable data (e.g. DIDs).
+    cacheL2Enabled: parseBoolean(env.CACHE_L2_ENABLED, true),
+    cacheL2KeyPrefix: env.CACHE_L2_KEY_PREFIX ?? "cache:",
+    cacheL2TtlDefaultMs: parseInteger(env.CACHE_L2_TTL_DEFAULT_MS, 60_000),
+    cacheL2TtlDidMs: parseInteger(env.CACHE_L2_TTL_DID_MS, 60_000),
+    cacheL2TtlCredentialMs: parseInteger(env.CACHE_L2_TTL_CREDENTIAL_MS, 30_000),
+    cacheL2TtlVerificationMs: parseInteger(env.CACHE_L2_TTL_VERIFICATION_MS, 10_000),
+    cacheL2TtlApiResponseMs: parseInteger(env.CACHE_L2_TTL_API_RESPONSE_MS, 5_000),
+    cacheL2TtlSessionMs: parseInteger(env.CACHE_L2_TTL_SESSION_MS, 300_000),
+    cacheL2TtlAnalyticsMs: parseInteger(env.CACHE_L2_TTL_ANALYTICS_MS, 600_000),
+    // L3: CDN. Purging is opt-in; without a purge URL the CDN is assumed to
+    // expire entries on its own TTL.
+    cacheL3Enabled: parseBoolean(env.CACHE_L3_ENABLED, false),
+    cacheL3PurgeUrl: env.CACHE_L3_PURGE_URL ?? "",
+    cacheL3PurgeToken: env.CACHE_L3_PURGE_TOKEN ?? "",
+    cacheL3PurgeTimeoutMs: parseInteger(env.CACHE_L3_PURGE_TIMEOUT_MS, 5000),
+    // Cache warming: a cron schedule (empty disables) plus the list of keys
+    // to preload on startup and on each scheduled run.
+    cacheWarmEnabled: parseBoolean(env.CACHE_WARM_ENABLED, false),
+    cacheWarmCronSchedule: env.CACHE_WARM_CRON_SCHEDULE ?? "",
+    cacheWarmKeys: parseList(env.CACHE_WARM_KEYS, []),
+    cacheWarmOnStartup: parseBoolean(env.CACHE_WARM_ON_STARTUP, true),
+    // Stampede prevention: a per-key lock so only one caller recomputes a
+    // missing entry while the rest wait (or serve stale) instead of all
+    // hammering the origin at once.
+    cacheStampedeLockTtlMs: parseInteger(env.CACHE_STAMPEDE_LOCK_TTL_MS, 5000),
+    cacheStampedeWaitTimeoutMs: parseInteger(env.CACHE_STAMPEDE_WAIT_TIMEOUT_MS, 2000),
+    cacheStampedeServeStale: parseBoolean(env.CACHE_STAMPEDE_SERVE_STALE, true),
+    // Hit-rate monitoring: per-layer counters exposed on the metrics endpoint.
+    cacheMetricsEnabled: parseBoolean(env.CACHE_METRICS_ENABLED, true),
+    cacheMetricsLogIntervalMs: parseInteger(
+      env.CACHE_METRICS_LOG_INTERVAL_MS,
+      60_000,
+      true,
+    ),
+    // API usage metering and billing (#1119).
+    meteringEnabled: parseBoolean(env.METERING_ENABLED, false),
+    // Where usage records are persisted (JSONL append log).
+    usageStoragePath: env.USAGE_STORAGE_PATH
+      ? path.resolve(env.USAGE_STORAGE_PATH)
+      : path.join(DEFAULT_DATA_DIR, "usage"),
+    // Tier definitions: name -> monthly included calls and per-call overage
+    // price in cents. Overridable as JSON so pricing can change without a
+    // deploy; the defaults mirror the documented Free/Pro/Enterprise tiers.
+    billingTiers: parseJson(env.BILLING_TIERS, {
+      free: { monthlyCalls: 1000, overageCentsPerCall: 0, custom: false },
+      pro: { monthlyCalls: 50000, overageCentsPerCall: 1, custom: false },
+      enterprise: { monthlyCalls: 0, overageCentsPerCall: 0, custom: true },
+    }),
+    billingDefaultTier: (env.BILLING_DEFAULT_TIER ?? "free").trim().toLowerCase(),
+    // Stripe integration. Without a secret key invoices are generated but
+    // never charged, so a deployment can meter usage before billing is live.
+    stripeApiKey: env.STRIPE_API_KEY ?? "",
+    stripeWebhookSecret: env.STRIPE_WEBHOOK_SECRET ?? "",
+    stripeApiBaseUrl: env.STRIPE_API_BASE_URL ?? "https://api.stripe.com",
+    stripeTimeoutMs: parseInteger(env.STRIPE_TIMEOUT_MS, 10_000),
+    // Monthly invoice generation. Empty schedule falls back to the 1st of the
+    // month at midnight.
+    invoiceCronSchedule: env.INVOICE_CRON_SCHEDULE ?? "0 0 1 * *",
+    invoiceCurrency: (env.INVOICE_CURRENCY ?? "usd").trim().toLowerCase(),
+    // Overage alerts: warn once usage crosses these percentages of the
+    // tier's included quota.
+    usageAlertThresholds: parseThresholds(env.USAGE_ALERT_THRESHOLDS, [80, 100]),
+    usageAlertWebhookUrl: env.USAGE_ALERT_WEBHOOK_URL ?? "",
+    // Usage-based discounts: percentage off the overage charge once a
+    // customer's monthly call volume reaches the given threshold.
+    usageDiscountTiers: parseJson(env.USAGE_DISCOUNT_TIERS, []),
     healthProbeTimeoutMs: parseInteger(env.HEALTH_PROBE_TIMEOUT_MS, 2000),
     redisUrl: env.REDIS_URL ?? "",
     accessLogEnabled: env.ACCESS_LOG_ENABLED !== "false",
@@ -470,6 +583,9 @@ export function loadConfig(env = process.env) {
     dbPoolIdleTimeoutMs: parseInteger(env.DB_POOL_IDLE_TIMEOUT_MS, 30000),
     dbPoolMaxConnectionAgeMs: parseInteger(env.DB_POOL_MAX_CONNECTION_AGE_MS, 3600000),
     dbPoolHealthCheckIntervalMs: parseInteger(env.DB_POOL_HEALTH_CHECK_INTERVAL_MS, 30000),
+    // #1325 BUG-28: session timezone applied to every DB connection so all
+    // stored timestamps are UTC regardless of the server's local timezone.
+    dbTimezone: resolveDbTimezone(env),
     // Job queue for async processing (#716)
     jobQueueEnabled: parseBoolean(env.JOB_QUEUE_ENABLED, true),
     jobQueueConcurrency: parseInteger(env.JOB_QUEUE_CONCURRENCY, 4),
@@ -487,369 +603,4 @@ export function loadConfig(env = process.env) {
     // endpoints configured every query goes to the primary, so an existing
     // single-region deployment is unaffected.
     readReplicasEnabled: parseBoolean(env.READ_REPLICAS_ENABLED, false),
-    // Region -> replica endpoint, e.g. {"us":"https://us.db.example.com"}.
-    replicaEndpoints: parseReplicaEndpoints(env.REPLICA_ENDPOINTS),
-    // Region -> nearest replica region, e.g. {"us-east-1":"us"}.
-    replicaRegionRouting: parseRegionRouting(env.REPLICA_REGION_ROUTING),
-    // Region this instance runs in; used as the routing fallback.
-    replicaLocalRegion: (env.REPLICA_LOCAL_REGION ?? "").trim().toLowerCase(),
-    // Replica lag above this (ms) takes the replica out of rotation.
-    replicaMaxLagMs: parseInteger(env.REPLICA_MAX_LAG_MS, 5000),
-    // Lag above this (ms) is logged as a warning but still serves reads.
-    replicaWarnLagMs: parseInteger(env.REPLICA_WARN_LAG_MS, 1000),
-    // How often replica lag is sampled (0 disables the monitor).
-    replicaLagCheckIntervalMs: parseInteger(
-      env.REPLICA_LAG_CHECK_INTERVAL_MS,
-      10_000,
-      true,
-    ),
-    // Consecutive failed health checks before a replica is marked down.
-    replicaFailureThreshold: parseInteger(env.REPLICA_FAILURE_THRESHOLD, 3),
-    // Consecutive successful checks before a down replica is restored.
-    replicaRecoveryThreshold: parseInteger(env.REPLICA_RECOVERY_THRESHOLD, 2),
-    // When true, reads fall back to the primary if every replica is unhealthy.
-    replicaFailoverToPrimary: parseBoolean(env.REPLICA_FAILOVER_TO_PRIMARY, true),
-    // When true, a read that must observe its own write is sent to the primary
-    // instead of a possibly-stale replica.
-    replicaReadAfterWriteConsistency: parseBoolean(
-      env.REPLICA_READ_AFTER_WRITE_CONSISTENCY,
-      true,
-    ),
-    // Window (ms) after a write during which reads are pinned to the primary.
-    replicaConsistencyWindowMs: parseInteger(
-      env.REPLICA_CONSISTENCY_WINDOW_MS,
-      2000,
-    ),
-    // Jaeger distributed tracing (#714)
-    jaegerEnabled: parseBoolean(env.JAEGER_ENABLED, false),
-    jaegerServiceName: env.JAEGER_SERVICE_NAME ?? "soroban-identity-server",
-    jaegerAgentHost: env.JAEGER_AGENT_HOST ?? "localhost",
-    jaegerAgentPort: parseInteger(env.JAEGER_AGENT_PORT, 6832),
-    jaegerSamplerType: env.JAEGER_SAMPLER_TYPE ?? "const",
-    jaegerSamplerParam: parseFloat(env.JAEGER_SAMPLER_PARAM ?? "1"),
-    jaegerReporterLogSpans: parseBoolean(env.JAEGER_REPORTER_LOG_SPANS, false),
-    jaegerReporterFlushInterval: parseInteger(env.JAEGER_REPORTER_FLUSH_INTERVAL, 1000),
-  };
-}
-
-export function validateConfig(env = process.env) {
-  const missing = [];
-  const invalid = [];
-
-  const sourceAccount = resolveSourceAccount(env);
-  if (!sourceAccount) {
-    missing.push("STELLAR_SECRET_KEY: Stellar account secret key (S…)");
-  } else {
-    if (!/^S[A-Z2-7]{55}$/.test(sourceAccount)) {
-      invalid.push(
-        "STELLAR_SECRET_KEY: Stellar account secret key must start with S and be 56 characters long",
-      );
-    }
-  }
-
-  const credentialContract =
-    env.CREDENTIAL_CONTRACT_ID ?? env.CREDENTIAL_MANAGER_ID;
-  if (!credentialContract) {
-    missing.push(
-      "CREDENTIAL_CONTRACT_ID: deployed credential contract address",
-    );
-  } else {
-    if (!/^C[A-Z2-7]{55}$/.test(credentialContract)) {
-      invalid.push(
-        "CREDENTIAL_CONTRACT_ID: deployed credential contract address must start with C and be 56 characters long",
-      );
-    }
-  }
-
-  const numericVars = [
-    { key: "PORT", desc: "must be a valid integer" },
-    { key: "EXPIRY_WARNING_DAYS", desc: "must be a valid integer" },
-    { key: "EXPIRY_JOB_INTERVAL_MS", desc: "must be a valid integer" },
-    { key: "EXPIRY_CONCURRENCY", desc: "must be a valid integer" },
-    { key: "SOROBAN_POOL_SIZE", desc: "must be a valid integer" },
-    { key: "SOROBAN_INVOKE_TIMEOUT_MS", desc: "must be a valid integer" },
-    { key: "RPC_CACHE_TTL_MS", desc: "must be a valid integer" },
-    { key: "RPC_MAX_RETRIES", desc: "must be a valid integer" },
-    { key: "RPC_RETRY_BASE_MS", desc: "must be a valid integer" },
-    { key: "RPC_RETRY_BACKOFF", desc: "must be a valid integer" },
-    { key: "EVENT_POLL_INTERVAL_MS", desc: "must be a valid integer" },
-    { key: "LONG_POLL_DEFAULT_TIMEOUT_MS", desc: "must be a valid integer" },
-    { key: "LONG_POLL_MAX_TIMEOUT_MS", desc: "must be a valid integer" },
-    { key: "RATE_LIMIT_MAX_BUCKETS", desc: "must be a valid integer" },
-    { key: "CORS_MAX_AGE", desc: "must be a valid integer" },
-    { key: "ACCESS_LOG_MAX_BYTES", desc: "must be a valid integer" },
-    { key: "ACCESS_LOG_MAX_FILES", desc: "must be a valid integer" },
-    { key: "LOG_PAYLOAD_MAX_BYTES", desc: "must be a valid integer" },
-    { key: "OAUTH_AUTH_CODE_TTL_MS", desc: "must be a valid integer" },
-    { key: "OAUTH_ACCESS_TOKEN_TTL_MS", desc: "must be a valid integer" },
-    { key: "OAUTH_REFRESH_TOKEN_TTL_MS", desc: "must be a valid integer" },
-    { key: "REQUEST_NONCE_TTL_SECONDS", desc: "must be a valid integer" },
-  ];
-
-  for (const item of numericVars) {
-    const val = env[item.key];
-    if (val !== undefined && val !== "") {
-      if (!/^\d+$/.test(val)) {
-        invalid.push(`${item.key}: ${item.desc}`);
-      }
-    }
-  }
-
-  const corsOrigin = env.CORS_ORIGIN ?? env.CORS_ALLOWED_ORIGINS;
-  if (corsOrigin !== undefined && corsOrigin !== "" && corsOrigin.trim() !== "*") {
-    for (const origin of corsOrigin.split(",").map((o) => o.trim()).filter(Boolean)) {
-      let parsed;
-      try {
-        parsed = new URL(origin);
-      } catch {
-        invalid.push(
-          `CORS_ORIGIN: '${origin}' must be an absolute origin such as https://app.example.com, or '*'`,
-        );
-        continue;
-      }
-      // An Origin header carries scheme://host[:port] and nothing else, so a
-      // configured value with a path or query can never match a real request.
-      if (parsed.pathname !== "/" || parsed.search || parsed.hash) {
-        invalid.push(
-          `CORS_ORIGIN: '${origin}' must not include a path, query or fragment`,
-        );
-      }
-    }
-  }
-
-  const corsCredentials = env.CORS_CREDENTIALS;
-  if (corsCredentials !== undefined && corsCredentials !== "") {
-    const normalized = String(corsCredentials).trim().toLowerCase();
-    const known = ["true", "1", "yes", "on", "false", "0", "no", "off"];
-    if (!known.includes(normalized)) {
-      invalid.push("CORS_CREDENTIALS: must be one of true/false/1/0/yes/no/on/off");
-    } else if (["true", "1", "yes", "on"].includes(normalized)) {
-      // The CORS spec forbids credentials with a wildcard origin: a browser
-      // rejects the response outright, so this combination is never usable.
-      const nodeEnvValue = env.NODE_ENV ?? "development";
-      const effectiveOrigins =
-        corsOrigin ?? (nodeEnvValue === "development" ? "*" : "");
-      if (String(effectiveOrigins).trim() === "*") {
-        invalid.push(
-          "CORS_CREDENTIALS: cannot be enabled while CORS_ORIGIN is '*' — name the allowed origins explicitly",
-        );
-      }
-    }
-  }
-
-  const rpcUrl = env.STELLAR_RPC_URL ?? env.RPC_URL;
-  if (rpcUrl !== undefined && rpcUrl !== "") {
-    try {
-      new URL(rpcUrl);
-    } catch {
-      invalid.push("STELLAR_RPC_URL: must be a valid URL");
-    }
-  }
-
-  const redisUrl = env.REDIS_URL;
-  if (redisUrl !== undefined && redisUrl !== "") {
-    try {
-      const parsed = new URL(redisUrl);
-      if (parsed.protocol !== "redis:" && parsed.protocol !== "rediss:") {
-        invalid.push("REDIS_URL: must use the redis:// or rediss:// scheme");
-      }
-    } catch {
-      invalid.push("REDIS_URL: must be a valid URL");
-    }
-  }
-
-  const webhookUrl = env.NOTIFICATION_WEBHOOK_URL;
-  if (webhookUrl !== undefined && webhookUrl !== "") {
-    try {
-      new URL(webhookUrl);
-    } catch {
-      invalid.push("NOTIFICATION_WEBHOOK_URL: must be a valid URL");
-    }
-  }
-
-  const emailApiUrl = env.EMAIL_API_URL;
-  if (emailApiUrl !== undefined && emailApiUrl !== "") {
-    try {
-      new URL(emailApiUrl);
-    } catch {
-      invalid.push("EMAIL_API_URL: must be a valid URL");
-    }
-    if (!env.EMAIL_FROM) {
-      invalid.push("EMAIL_FROM: required when EMAIL_API_URL is set");
-    }
-  }
-
-  // Geo-distributed read replicas (#1051): every configured endpoint must be a
-  // usable URL, and routing must only point at regions that exist.
-  const replicaEndpoints = parseReplicaEndpoints(env.REPLICA_ENDPOINTS);
-  for (const [region, endpoint] of Object.entries(replicaEndpoints)) {
-    try {
-      new URL(endpoint);
-    } catch {
-      invalid.push(
-        `REPLICA_ENDPOINTS: '${region}' must map to a valid URL, got '${endpoint}'`,
-      );
-    }
-  }
-
-  const replicaRouting = parseRegionRouting(env.REPLICA_REGION_ROUTING);
-  for (const [region, replica] of Object.entries(replicaRouting)) {
-    if (!replicaEndpoints[replica]) {
-      invalid.push(
-        `REPLICA_REGION_ROUTING: '${region}' points at unknown replica region '${replica}'`,
-      );
-    }
-  }
-
-  if (
-    parseBoolean(env.READ_REPLICAS_ENABLED, false) &&
-    Object.keys(replicaEndpoints).length === 0
-  ) {
-    invalid.push(
-      "REPLICA_ENDPOINTS: required when READ_REPLICAS_ENABLED is true",
-    );
-  }
-
-  const replicaLocalRegion = (env.REPLICA_LOCAL_REGION ?? "").trim().toLowerCase();
-  if (
-    replicaLocalRegion &&
-    Object.keys(replicaEndpoints).length > 0 &&
-    !replicaEndpoints[replicaLocalRegion] &&
-    !replicaRouting[replicaLocalRegion]
-  ) {
-    invalid.push(
-      `REPLICA_LOCAL_REGION: '${replicaLocalRegion}' is neither a replica endpoint nor a routing key`,
-    );
-  }
-
-  const cronSchedule = env.EXPIRY_CRON_SCHEDULE;
-  if (cronSchedule !== undefined && cronSchedule !== "") {
-    try {
-      parseCronExpression(cronSchedule);
-    } catch (error) {
-      invalid.push(`EXPIRY_CRON_SCHEDULE: ${error.message}`);
-    }
-  }
-
-  const encryptionEnabled = parseBoolean(env.ENCRYPTION_ENABLED, false);
-  if (encryptionEnabled) {
-    const rotation = parseInteger(
-      env.ENCRYPTION_KEY_ROTATION_SECONDS,
-      DEFAULT_ENCRYPTION_KEY_ROTATION_SECONDS,
-    );
-    const ttl = parseInteger(
-      env.ENCRYPTION_SESSION_TTL_SECONDS,
-      DEFAULT_ENCRYPTION_SESSION_TTL_SECONDS,
-    );
-    // A rotation interval at or beyond the session TTL would let a key expire
-    // before it is ever rotated, leaving clients unable to decrypt responses.
-    if (rotation >= ttl) {
-      invalid.push(
-        "ENCRYPTION_KEY_ROTATION_SECONDS: must be less than ENCRYPTION_SESSION_TTL_SECONDS",
-      );
-    }
-    const fields = parseList(env.ENCRYPTION_SENSITIVE_FIELDS, []);
-    if (fields.length === 0) {
-      invalid.push(
-        "ENCRYPTION_SENSITIVE_FIELDS: must list at least one response field when ENCRYPTION_ENABLED is true",
-      );
-    }
-  }
-
-  return {
-    isValid: missing.length === 0 && invalid.length === 0,
-    missing,
-    invalid,
-  };
-}
-
-export function logDefaultValues(env = process.env) {
-  const defaults = [
-    { key: "PORT", defaultVal: "3001" },
-    { key: "ADMIN_API_KEY", defaultVal: "''" },
-    { key: "ADMIN_ACTOR", defaultVal: "'admin'" },
-    { key: "DATA_DIR", defaultVal: "data" },
-    { key: "EXPIRY_WARNING_DAYS", defaultVal: "7" },
-    { key: "EXPIRY_JOB_INTERVAL_MS", defaultVal: "3600000" },
-    { key: "EXPIRY_CONCURRENCY", defaultVal: "8" },
-    { key: "RATE_LIMIT_WHITELIST", defaultVal: "'' (no exemptions)" },
-    { key: "RATE_LIMIT_MAX_BUCKETS", defaultVal: "10000" },
-    { key: "TRUST_PROXY", defaultVal: "false" },
-    { key: "REDIS_URL", defaultVal: "'' (cache disabled)" },
-    { key: "DID_CACHE_TTL_MS", defaultVal: "60000" },
-    { key: "REDIS_MAX_RETRIES", defaultVal: "5" },
-    { key: "CACHE_FAILURE_THRESHOLD", defaultVal: "3" },
-    { key: "HEALTH_PROBE_TIMEOUT_MS", defaultVal: "2000" },
-    { key: "REDIS_URL", defaultVal: "'' (disabled)" },
-    { key: "EXPIRY_CRON_SCHEDULE", defaultVal: "'' (interval mode)" },
-    { key: "ACCESS_LOG_ENABLED", defaultVal: "true" },
-    { key: "ACCESS_LOG_PATH", defaultVal: "'' (stdout only)" },
-    { key: "ACCESS_LOG_MAX_BYTES", defaultVal: "10485760" },
-    { key: "ACCESS_LOG_MAX_FILES", defaultVal: "5" },
-    { key: "LOG_PAYLOADS", defaultVal: "false" },
-    { key: "LOG_HEADERS", defaultVal: "false" },
-    { key: "TRUST_PROXY", defaultVal: "false" },
-    { key: "NOTIFICATION_WEBHOOK_URL", defaultVal: "''" },
-    { key: "EMAIL_API_URL", defaultVal: "''" },
-    { key: "EMAIL_FROM", defaultVal: "''" },
-    { key: "NOTIFICATION_EMAIL", defaultVal: "''" },
-    { key: "NOTIFICATION_MAX_RETRIES", defaultVal: "3" },
-    { key: "NOTIFICATION_RETRY_BASE_MS", defaultVal: "500" },
-    { key: "SUBJECT_NOTIFICATION_WEBHOOKS", defaultVal: "{}" },
-    { key: "SOROBAN_POOL_SIZE", defaultVal: "4" },
-    { key: "SOROBAN_INVOKE_TIMEOUT_MS", defaultVal: "10000" },
-    { key: "STELLAR_CLI", defaultVal: "'stellar'" },
-    { key: "STELLAR_NETWORK", defaultVal: "'testnet'" },
-    {
-      key: "STELLAR_RPC_URL",
-      defaultVal: "'https://soroban-testnet.stellar.org'",
-    },
-    { key: "RPC_CACHE_TTL_MS", defaultVal: "5000" },
-    { key: "RPC_MAX_RETRIES", defaultVal: "3" },
-    { key: "RPC_RETRY_BASE_MS", defaultVal: "500" },
-    { key: "RPC_RETRY_BACKOFF", defaultVal: "2" },
-    { key: "EVENT_POLL_INTERVAL_MS", defaultVal: "5000" },
-    { key: "LONG_POLL_DEFAULT_TIMEOUT_MS", defaultVal: "30000" },
-    { key: "LONG_POLL_MAX_TIMEOUT_MS", defaultVal: "60000" },
-    { key: "QUOTA_OVERAGE_MODE", defaultVal: "'block'" },
-    { key: "CORS_ORIGIN", defaultVal: "'*' in development, none in production" },
-    { key: "CORS_CREDENTIALS", defaultVal: "false" },
-    { key: "CORS_METHODS", defaultVal: DEFAULT_CORS_METHODS.join(",") },
-    { key: "CORS_ALLOWED_HEADERS", defaultVal: DEFAULT_CORS_ALLOWED_HEADERS.join(",") },
-    { key: "CORS_EXPOSED_HEADERS", defaultVal: DEFAULT_CORS_EXPOSED_HEADERS.join(",") },
-    { key: "CORS_MAX_AGE", defaultVal: String(DEFAULT_CORS_MAX_AGE) },
-    { key: "READ_REPLICAS_ENABLED", defaultVal: "false" },
-    { key: "REPLICA_ENDPOINTS", defaultVal: "{} (primary only)" },
-    { key: "REPLICA_REGION_ROUTING", defaultVal: "{}" },
-    { key: "REPLICA_LOCAL_REGION", defaultVal: "''" },
-    { key: "REPLICA_MAX_LAG_MS", defaultVal: "5000" },
-    { key: "REPLICA_WARN_LAG_MS", defaultVal: "1000" },
-    { key: "REPLICA_LAG_CHECK_INTERVAL_MS", defaultVal: "10000" },
-    { key: "REPLICA_FAILURE_THRESHOLD", defaultVal: "3" },
-    { key: "REPLICA_RECOVERY_THRESHOLD", defaultVal: "2" },
-    { key: "REPLICA_FAILOVER_TO_PRIMARY", defaultVal: "true" },
-    { key: "REPLICA_READ_AFTER_WRITE_CONSISTENCY", defaultVal: "true" },
-    { key: "REPLICA_CONSISTENCY_WINDOW_MS", defaultVal: "2000" },
-    { key: "JAEGER_ENABLED", defaultVal: "false" },
-    { key: "JAEGER_SERVICE_NAME", defaultVal: "'soroban-identity-server'" },
-    { key: "JAEGER_AGENT_HOST", defaultVal: "'localhost'" },
-    { key: "JAEGER_AGENT_PORT", defaultVal: "6832" },
-    { key: "JAEGER_SAMPLER_TYPE", defaultVal: "'const'" },
-    { key: "JAEGER_SAMPLER_PARAM", defaultVal: "1" },
-    { key: "REQUEST_NONCE_ENABLED", defaultVal: "false" },
-    { key: "REQUEST_NONCE_TTL_SECONDS", defaultVal: "300" },
-    { key: "REQUEST_NONCE_HEADER", defaultVal: "'X-Nonce'" },
-  ];
-
-  for (const item of defaults) {
-    let val;
-    if (item.key === "STELLAR_RPC_URL") {
-      val = env.STELLAR_RPC_URL ?? env.RPC_URL;
-    } else {
-      val = env[item.key];
-    }
-    if (val === undefined || val === "") {
-      logger.info({ variable: item.key, defaultValue: item.defaultVal }, 'Using default config value');
-    }
-  }
-}
+    // Region -> replica endpoint, e.g. {"us":"https://us
