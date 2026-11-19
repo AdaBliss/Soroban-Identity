@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from "react";
 import type { Credential } from "../../../sdk/src/types";
 import { trackShareEvent } from "../utils/credentialCrypto";
+import { copyToClipboard } from "../utils/clipboard";
 import { useToast } from "../context/ToastContext";
 import SocialShare from "./SocialShare";
 import { useOpenGraphMeta } from "../hooks/useOpenGraphMeta";
@@ -170,7 +171,11 @@ export const CredentialShare: React.FC<CredentialShareProps> = ({ credential, on
   const handleCopy = async () => {
     if (!effectiveShareUrl) return;
     try {
-      await navigator.clipboard.writeText(effectiveShareUrl);
+      const success = await copyToClipboard(effectiveShareUrl);
+      if (!success) {
+        toast.error("Failed to copy to clipboard.");
+        return;
+      }
       setCopied(true);
       trackShareEvent("credential_share_link_copied", {
         credentialId: credential.id,

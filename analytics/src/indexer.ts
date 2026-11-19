@@ -20,6 +20,25 @@ const COUNTRY_LOOKUPS_PER_TICK = 50;
 
 type RpcEvent = SorobanRpc.Api.EventResponse;
 
+/**
+ * All `ts` fields written by the indexer are unix epoch milliseconds in UTC.
+ * `Date.now()` is already UTC epoch ms; never build timestamps from
+ * local-time strings.
+ */
+function utcNowMs(): number {
+  return Date.now();
+}
+
+/**
+ * Parse an ISO-8601 ledger close time as UTC. RPC normally returns a `Z`
+ * suffix, but if the offset is missing we treat the value as UTC rather than
+ * letting `Date.parse` fall back to the server's local timezone.
+ */
+function parseUtcMs(value: string): number {
+  const hasZone = /(?:[zZ]|[+-]\d{2}:?\d{2})$/.test(value);
+  return Date.parse(hasZone ? value : `${value}Z`);
+}
+
 function symbolOf(val: xdr.ScVal | undefined): string | undefined {
   try {
     return val ? String(scValToNative(val)) : undefined;
@@ -169,7 +188,8 @@ export class Indexer {
 
     const contractId = ev.contractId?.toString();
     const [ns, action] = ev.topic.map(symbolOf);
-    const ts = Date.parse(ev.ledgerClosedAt);
+    // ts is unix ms UTC, parsed from the ledger close time (UTC).
+    const ts = parseUtcMs(ev.ledgerClosedAt);
     const base = { id: ev.id, ledger: ev.ledger, ts };
     let fields: unknown[];
     try {
@@ -243,6 +263,7 @@ export class Indexer {
         if (ids === null) continue;
         const txId = `tx:${tx.txHash ?? `${tx.ledger}:${tx.applicationOrder}`}`;
         // One record per credential checked, so batch calls count each check.
+        // ts is unix ms UTC (createdAt is unix seconds UTC).
         (ids.length ? ids : [undefined]).forEach((credentialId, i) =>
           this.store.addVerification({ id: `${txId}:${i}`, source: "onchain", credentialId, ts: tx.createdAt * 1000 })
         );
@@ -289,6 +310,11 @@ export class Indexer {
       }
     }
     return null;
+  }
+
+  /** Current time as unix ms UTC, for any locally-generated records. */
+  private now(): number {
+    return utcNowMs();
   }
 
   private async rpc<T>(method: string, params: unknown): Promise<T> {

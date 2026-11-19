@@ -85,6 +85,7 @@ const ActivityFeed: React.FC = () => {
   const [startDate, setStartDate] = useState('');
   const [endDate, setEndDate] = useState('');
   const sentinelRef = useRef<HTMLDivElement | null>(null);
+  const isLoadingRef = useRef(false);
 
   const toggleType = useCallback((type: ActivityType) => {
     setSelectedTypes((prev) =>
@@ -130,8 +131,22 @@ const ActivityFeed: React.FC = () => {
     const observer = new IntersectionObserver(
       (entries) => {
         const entry = entries[0];
-        if (entry.isIntersecting && hasMore && !loading) {
-          loadMore();
+        if (!entry.isIntersecting) return;
+        if (!hasMore || loading || isLoadingRef.current) return;
+
+        isLoadingRef.current = true;
+        try {
+          const result = loadMore() as unknown;
+          if (result && typeof (result as Promise<unknown>).finally === 'function') {
+            (result as Promise<unknown>).finally(() => {
+              isLoadingRef.current = false;
+            });
+          } else {
+            isLoadingRef.current = false;
+          }
+        } catch (err) {
+          isLoadingRef.current = false;
+          throw err;
         }
       },
       { rootMargin: '200px' }
