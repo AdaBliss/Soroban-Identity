@@ -30,6 +30,9 @@ pub use presentation::{
     PresentationVerificationResult,
 };
 
+mod attestation;
+pub use attestation::Attestation;
+
 mod oracle;
 pub use oracle::{
     DataFeedSchema, OracleConfig, OracleNode, OracleRequest, OracleResponse,
@@ -310,6 +313,8 @@ pub enum ContractError {
     PresentationChallengeMismatch = 85,
     /// W3C VP: presentation domain mismatch.
     PresentationDomainMismatch = 86,
+    AttestationNotFound = 87,
+    AttestationExpired = 88,
 }
 
 // ── Data types ────────────────────────────────────────────────────────────────
@@ -2517,6 +2522,27 @@ impl CredentialManager {
             .persistent()
             .get(&(CRED_VERSIONS, credential_id))
             .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    pub fn issue_attestation(
+        env: Env,
+        issuer: Address,
+        id: BytesN<32>,
+        subject: Address,
+        claims: Map<String, String>,
+        expires_at_ledger: u32,
+    ) -> bool {
+        issuer.require_auth();
+        attestation::issue_attestation(&env, &issuer, id, subject, claims, expires_at_ledger)
+    }
+
+    pub fn verify_attestation(env: Env, attestation_id: BytesN<32>) -> bool {
+        attestation::verify_attestation(&env, &attestation_id)
+    }
+
+    pub fn revoke_attestation(env: Env, issuer: Address, attestation_id: BytesN<32>) -> bool {
+        issuer.require_auth();
+        attestation::revoke_attestation(&env, &issuer, &attestation_id)
     }
 
     pub fn verify_credential(env: Env, credential_id: BytesN<32>) -> Result<(), ContractError> {

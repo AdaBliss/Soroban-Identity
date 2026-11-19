@@ -1482,8 +1482,8 @@ export function createApp({
           return sendFormatted(req, res, 200, { verified: true, credential });
         }
 
-        // Interactive Swagger UI (#830)
-        if (req.method === "GET" && (pathname === "/api/docs" || pathname === "/api/docs/")) {
+        // Interactive Swagger UI (#830, #1295)
+        if (req.method === "GET" && ["/api/docs", "/api/docs/", "/api-docs", "/api-docs/"].includes(pathname)) {
           try {
             const html = await fs.readFile(new URL("../../docs/api/swagger.html", import.meta.url), "utf8");
             res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
@@ -1494,19 +1494,24 @@ export function createApp({
         }
 
         if (req.method === "GET" && pathname === "/openapi.json") {
-          try {
-            const openApiPath = path.resolve(process.cwd(), "openapi.json");
-            const content = await fs.readFile(openApiPath, "utf8");
-            return sendJson(res, 200, JSON.parse(content));
-          } catch {
+          const candidates = [
+            path.resolve(process.cwd(), "openapi.generated.json"),
+            path.resolve(process.cwd(), "server/openapi.generated.json"),
+            path.resolve(process.cwd(), "openapi.json"),
+            path.resolve(process.cwd(), "server/openapi.json"),
+          ];
+          for (const candidate of candidates) {
             try {
-              const fallbackPath = path.resolve(process.cwd(), "server/openapi.json");
-              const content = await fs.readFile(fallbackPath, "utf8");
+              const content = await fs.readFile(candidate, "utf8");
               return sendJson(res, 200, JSON.parse(content));
-            } catch (err) {
-              return sendJson(res, 500, { error: "openapi_spec_unavailable", message: err.message });
+            } catch {
+              continue;
             }
           }
+          return sendJson(res, 500, {
+            error: "openapi_spec_unavailable",
+            message: "No OpenAPI specification could be loaded.",
+          });
         }
 
         // ── OAuth 2.0 Authorization Server (#744) ───────────────────────
