@@ -1,12 +1,3 @@
-import { URL } from 'node:url';
-import crypto from 'node:crypto';
-import { appendAuditLog, readCredentials } from './storage.js';
-import { findExpiringCredentials, paginate } from './expiry.js';
-import { notFound, readJson, requireAdmin, sendJson, sendText } from './http-utils.js';
-import { requestContextStore } from './request-context.js';
-import { logger } from './logger.js';
-
-export function createApp({ config, soroban, metrics, metricsAggregator }) {
 import { URL } from "node:url";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
@@ -23,10 +14,6 @@ import {
 } from "./storage.js";
 import { findExpiringCredentials, paginate } from "./expiry.js";
 import {
-  buildPaginationMeta,
-  decodeOffsetCursor,
-  paginateArray,
-  resolvePageSize,
   setPaginationHeaders,
 } from "./routes/pagination.js";
 import {
@@ -60,6 +47,16 @@ import {
   validateContentType,
 } from "./http-utils.js";
 import { KEY_ID_HEADER, NonceStore, verifySignedRequest } from "./request-signing.js";
+import {
+  ENCRYPTION_ENABLED_HEADER,
+  ENCRYPTION_KEY_ID_HEADER,
+  SessionKeyRegistry,
+  decryptSensitiveRequestFields,
+  encryptSensitiveResponseFields,
+  isEncryptionEnabled,
+  negotiateSessionKey,
+  wrapResponseEncryption,
+} from "./response-encryption.js";
 import { normalizeCspReports, setSecurityHeaders } from "./security-headers.js";
 import {
   CREDENTIAL_STATUS_TYPE,
@@ -78,17 +75,32 @@ function wantsJsonLd(req, url) {
   const accept = String(req.headers.accept ?? "");
   return accept.includes("application/ld+json");
 }
-import { schemas, validateRequest } from "./validation.js";
+import { sanitizeDidMetadata, schemas, validateRequest } from "./validation.js";
+import {
+  buildApiRootLinks,
+  buildCredentialCollectionLinks,
+  buildCredentialLinks,
+  buildDidLinks,
+  buildWebhookLinks,
+  formatLinkHeader,
+  resolveLinkPrefix,
+} from "./hateoas.js";
 import { routeLabel } from "./route-label.js";
 import { requestContextStore } from "./request-context.js";
 import { correlationMiddleware, handleTraceRoutes } from "./middleware/tracing.js";
-import { cursorPage, offsetMeta, offsetPage, pageNumberMeta, setPaginationHeaders } from "./routes/pagination.js";
+import { cursorPage, offsetMeta, offsetPage, pageNumberMeta } from "./routes/pagination.js";
 import { handleEventsRequest } from "./sse.js";
 import { handleLongPollRequest } from "./long-poll.js";
 import { logger } from "./logger.js";
 import { AnalyticsService, detectCountry } from "./analytics.js";
 import { createRateLimiter } from "./middleware/ratelimit.js";
 import { ApiKeyService } from "./api-keys.js";
+import { OAuthService, OAuthError } from "./oauth.js";
+import { computeEtag, matchesIfNoneMatch, matchesIfMatch } from "./etag.js";
+import { applyFieldFiltering } from "./field-filter.js";
+import { createCompressionMiddleware } from "./compression.js";
+import { executeBatch } from "./batch.js";
+import { readNotificationLog, summarizeNotificationLog } from "./notification-log.js";
 import { UsageTracker } from "./analytics/usage.js";
 import { EmailTransport } from "./email.js";
 import { pickQuotaBinding, QuotaTracker, notifyQuotaThresholdOwner } from "./quota.js";
@@ -97,6 +109,11 @@ import { DdosProtection, ddosResponse } from "./ddos-protection.js";
 import { TenantRegistry, handleTenantRoutes, resolveTenantId } from "./tenancy/index.js";
 import { openTelemetryHttpMiddleware } from "./tracing/index.js";
 import { EventStore, EventReplayer, createEvent, EventTypes, handleEventSourcingRoutes } from "./events/index.js";
+import { handleMockApiRequest } from "./mock-api.js";
+import { collectHealth, collectReadiness } from "./health.js";
+import { CacheManager, CACHE_TTL, cacheKey } from "./cache/index.js";
+import { MeteringService, meteringMiddleware, handleBillingRoutes } from "./billing/index.js";
+import { createRequestDeduplication } from "./middleware/dedupe.js";
 const SERVER_VERSION = "0.1.0";
 const MIN_SDK_VERSION = "0.1.0";
 const SERVER_FEATURES = [
@@ -110,11 +127,28 @@ const SERVER_FEATURES = [
   "response_compression",
   "job_queue",
   "graceful_shutdown",
+  "hateoas",
+  "multi_layer_cache",
+  "usage_metering",
+  "billing",
 ];
 
-export function createApp({ config, soroban, metrics, metricsAggregator, analytics = new AnalyticsService() }) {
-  return function app(req, res) {
-    const startTime = Date.now();
+/** Top-level fields selectable via `?fields=` on a credential resource. */
+const CREDENTIAL_FIELDS = [
+  "id",
+  "subject",
+  "issuer",
+  "type",
+  "claims",
+  "expiresAt",
+  "expires_at",
+  "issuedAt",
+  "issued_at",
+  "revoked",
+  "revokedAt",
+  "metadata",
+];
+
 const usageTracker = new UsageTracker();
 
 export function createApp({
@@ -122,6 +156,7 @@ export function createApp({
   soroban,
   metrics,
   metricsAggregator,
+  analytics = new AnalyticsService(),
   didCache = null,
   // Health and readiness probes only need something that can answer PING;
   // the DID cache already owns a connected client, so reuse it unless a
@@ -130,19 +165,26 @@ export function createApp({
   webhookService = new WebhookDeliveryService(config),
   apiKeyService = new ApiKeyService(config),
   oauthService = new OAuthService(config),
+  credentialIssueQueue = config.credentialIssueQueue ?? null,
+  batchVerificationQueue = config.batchVerificationQueue ?? null,
   rateLimiter = null,
   accessLogSink = null,
   realtime = null,
   nonceStore = new NonceStore({ ttlSeconds: config.requestSigningMaxAgeSeconds }),
+  replayNonceStore = null,
   vcSerializer = createVcSerializer(config, { logger }),
   emailTransport = new EmailTransport(config),
   quotaTracker = null,
   deprecationRegistry = null,
   ddosProtection = null,
+  sessionKeyRegistry = null,
+  cacheManager = null,
+  meteringService = null,
 }) {
   // Expose the key service on config so http-utils.requireAuth can validate
   // issued API keys instead of falling back to the single admin key.
   config.apiKeyService = apiKeyService;
+  config.oauthService = oauthService;
   
   // Expose job queues on config for route handlers
   config.credentialIssueQueue = credentialIssueQueue;
@@ -190,14 +232,95 @@ export function createApp({
       },
     });
 
+  // Per-session AES-GCM key registry (#1049). Keys are generated per session,
+  // rotated on demand, and never persisted: a restart simply invalidates the
+  // sessions that were using them.
+  const encryptionKeys =
+    sessionKeyRegistry ??
+    (isEncryptionEnabled(config)
+      ? new SessionKeyRegistry({
+          ttlSeconds: config.encryptionSessionKeyTtlSeconds,
+          rotationSeconds: config.encryptionKeyRotationSeconds,
+          maxKeys: config.encryptionMaxSessionKeys,
+        })
+      : null);
+
   const tenantRegistry = new TenantRegistry(config);
   void tenantRegistry.init();
+
+  // #1052: nonce-based replay prevention for sensitive (state-changing)
+  // operations. Backed by Redis when available so nonces are shared across
+  // instances; falls back to an in-process store otherwise.
+  const replayStore =
+    replayNonceStore ??
+    new NonceStore({ ttlSeconds: config.nonceTtlSeconds ?? 300 });
+  const checkNonce = async (req, res) => {
+    const nonce = req.headers["x-nonce"] ?? req.headers["x-request-nonce"] ?? null;
+    if (!nonce) {
+      return {
+        ok: false,
+        status: 400,
+        code: "MISSING_NONCE",
+        reason: "missing",
+        message: "A request nonce is required for state-changing requests.",
+      };
+    }
+    const accepted = await replayStore.consume(nonce, { scope: req.apiKeyId ?? "" });
+    if (!accepted) {
+      return {
+        ok: false,
+        status: 409,
+        code: "SIGNATURE_REPLAYED",
+        reason: "replayed",
+        message: "Request nonce has already been used.",
+      };
+    }
+    return { ok: true, serverNonce: crypto.randomUUID() };
+  };
 
   const eventStore = new EventStore({ dataDir: `${config.dataDir}/events` });
   void eventStore.init();
   const eventReplayer = new EventReplayer(eventStore);
 
+  // #1118: multi-layer caching strategy. L1 is in-memory (LRU), L2 is Redis
+  // when available, L3 is CDN via response headers. The manager owns the
+  // warming scheduler and the invalidation pipeline.
+  const cache =
+    cacheManager ??
+    new CacheManager({
+      config,
+      redisClient,
+      metrics,
+      logger,
+    });
+  // Start the warming scheduler (no-op when disabled in config).
+  if (typeof cache.startWarming === "function") {
+    try {
+      cache.startWarming();
+    } catch (error) {
+      logger.warn({ error: error.message }, "Failed to start cache warming scheduler");
+    }
+  }
+
+  // #1119: API usage metering and billing. The service tracks per-endpoint
+  // calls, enforces quotas, and generates invoices. When no service is
+  // supplied it is created from config so the routes always exist.
+  const metering =
+    meteringService ??
+    new MeteringService({
+      config,
+      apiKeyService,
+      emailTransport,
+      logger,
+      metrics,
+    });
+  const meter = meteringMiddleware({ service: metering, config });
+  const dedupe = createRequestDeduplication({
+    ttlMs: config.requestDeduplicationTtlMs ?? 5000,
+  });
+
   return async function app(req, res) {
+    const startTime = Date.now();
     const url = new URL(
       req.url,
       `http://${req.headers.host ?? "localhost"}`,
@@ -227,16 +350,9 @@ export function createApp({
       });
     }
 
-    // Check if this is the metrics endpoint before setting X-Request-ID
+    // Correlation IDs are validated and normalized by the middleware, then
+    // used consistently for both request-ID aliases and downstream context.
     const isMetricsEndpoint = req.method === "GET" && pathname === "/metrics";
-    
-    // Generate requestId for all endpoints except metrics
-    const requestId = isMetricsEndpoint ? null : (req.headers["x-correlation-id"] || req.headers["x-request-id"] || crypto.randomUUID());
-    
-    if (!isMetricsEndpoint) {
-      res.setHeader("X-Request-ID", requestId);
-      res.setHeader("X-Correlation-ID", requestId);
-    }
 
     // Resolve tenant context (#800)
     const tenantId = resolveTenantId(req);
@@ -245,8 +361,14 @@ export function createApp({
 
     // Correlation ID + trace record (#946). Every response, including the
     // metrics endpoint, carries X-Correlation-ID.
-    const correlationId = correlationMiddleware(req, res, { requestId, path: pathname });
+    const correlationId = correlationMiddleware(req, res, { path: pathname });
+    const requestId = correlationId;
 
+    // #1118: attach the cache manager to the request so handlers can read
+    // through it without threading it through every call site.
+    req.cache = cache;
+
+    const handler = async () => {
     // Distributed Tracing with OpenTelemetry (#801)
     openTelemetryHttpMiddleware()(req, res);
 
@@ -292,6 +414,16 @@ export function createApp({
       return res.writeHead(204).end();
     }
 
+    // End-to-end encryption for sensitive credential data (#1049). The
+    // middleware wraps sendJson/sendFormatted so any response body produced
+    // downstream is encrypted with the session key the client negotiated.
+    // It is a no-op unless the feature is enabled and the client presented a
+    // key id, so existing clients are unaffected.
+    if (isEncryptionEnabled(config)) {
+      res.setHeader("X-Encryption-Supported", "aes-256-gcm");
+      wrapResponseEncryption(req, res, { config, registry: encryptionKeys });
+    }
+
     // Record analytics when response completes
     res.on("finish", () => {
       const durationMs = Math.max(0, Date.now() - startTime);
@@ -317,13 +449,101 @@ export function createApp({
       });
     });
 
-    return requestContextStore.run({ requestId, correlationId }, async () => {
+        if (await handleMockApiRequest(req, res, config)) return;
+
+    // Session key exchange (#1049). Unauthenticated by design: the key it
+    // returns is only useful to the client that generated the ephemeral
+    // keypair, and it carries no authority of its own. The response is
+    // deliberately not encrypted — it is what establishes the key.
+    if (req.method === "POST" && pathname === "/encryption/session") {
+      if (validateContentType(req, res)) return;
+      const body = await readJson(req, config);
+      if (body.__payloadTooLarge) {
+        return sendJson(res, 413, { code: "PAYLOAD_TOO_LARGE", message: "Request body exceeds the size limit." });
+      }
+      const validated = validateRequest(res, schemas.encryptionSession, { body });
+      if (!validated.ok) return;
       try {
-        if (req.method === "GET" && url.pathname === "/info") {
-          return sendFormatted(req, res, 200, {
+        const negotiated = negotiateSessionKey({
+          config,
+          registry: encryptionKeys,
+          clientPublicKey: validated.data.body.clientPublicKey,
+          clientKeyId: validated.data.body.keyId ?? null,
+        });
+        return sendJson(res, 201, negotiated);
+      } catch (err) {
+        logger.warn({ error: err.message }, "Session key negotiation failed");
+        return sendJson(res, 400, {
+          error: "key_exchange_failed",
+          code: "KEY_EXCHANGE_FAILED",
+          message: err.message,
+        });
+      }
+    }
+
+    // Key rotation (#1049). A client that holds a key id may ask for a fresh
+    // key; the old one stays valid until its TTL elapses so in-flight
+    // responses encrypted with it can still be decrypted.
+    if (req.method === "POST" && pathname === "/encryption/rotate") {
+      const keyId = req.headers[ENCRYPTION_KEY_ID_HEADER] ?? null;
+      if (!keyId) {
+        return sendJson(res, 400, {
+          error: "missing_key_id",
+          code: "MISSING_KEY_ID",
+          message: `Provide the current session key id in the ${ENCRYPTION_KEY_ID_HEADER} header.`,
+        });
+      }
+      const rotated = encryptionKeys.rotate(keyId);
+      if (!rotated) {
+        return sendJson(res, 404, {
+          error: "unknown_key_id",
+          code: "UNKNOWN_KEY_ID",
+          message: "The supplied session key id is unknown or has expired.",
+        });
+      }
+      res.setHeader(ENCRYPTION_KEY_ID_HEADER, rotated.keyId);
+      return sendJson(res, 200, {
+        keyId: rotated.keyId,
+        algorithm: rotated.algorithm,
+        expiresAt: rotated.expiresAt,
+        previousKeyId: keyId,
+      });
+    }
+
     // Validate well-known request headers before any routing or auth work.
     if (!validateRequest(res, schemas.commonHeaders, { headers: req.headers }).ok) {
       return;
+    }
+
+    // Decrypt sensitive request fields (#1049) before any handler reads the
+    // body. The body is buffered and memoised, so readJson downstream sees
+    // the plaintext. A request that claims encryption but cannot be
+    // decrypted is rejected rather than silently processed as plaintext.
+    if (isEncryptionEnabled(config) && req.headers[ENCRYPTION_ENABLED_HEADER]) {
+      const { tooLarge, buffer } = await readRawBody(req, config);
+      if (tooLarge) {
+        return sendJson(res, 413, {
+          code: "PAYLOAD_TOO_LARGE",
+          message: "Request body exceeds the size limit.",
+        });
+      }
+      const decrypted = decryptSensitiveRequestFields({
+        headers: req.headers,
+        body: buffer,
+        registry: encryptionKeys,
+      });
+      if (!decrypted.ok) {
+        logger.warn({ code: decrypted.code, route: routeLabel(pathname) }, "Rejected encrypted request");
+        return sendJson(res, decrypted.status, {
+          error: "decryption_failed",
+          code: decrypted.code,
+          message: decrypted.message,
+        });
+      }
+      if (decrypted.body !== null) {
+        req.rawBody = decrypted.body;
+        req.encryptionKeyId = decrypted.keyId ?? null;
+      }
     }
 
     // Extract tier and API key ID from API key or headers early if present
@@ -360,6 +580,32 @@ export function createApp({
     // Rate limiting check (exempt /info, /health, /metrics)
     const isExempt = ["/info", "/health", "/ready", "/live", "/metrics"].includes(url.pathname);
 
+    // #1052: replay prevention. Only state-changing methods are checked, and
+    // operational endpoints (plus the browser-posted CSP report) are exempt
+    // because they cannot carry client credentials.
+    const isNonceExempt = isExempt || pathname === "/csp-report";
+    const isStateChanging = !["GET", "HEAD", "OPTIONS"].includes(req.method);
+    if (!isNonceExempt && isStateChanging) {
+      const nonceResult = await checkNonce(req, res);
+      if (!nonceResult.ok) {
+        metrics?.observeNonceCollision?.(nonceResult.reason ?? "replayed");
+        logger.warn(
+          { code: nonceResult.code, route: routeLabel(pathname), tenantId },
+          "Rejected replayed request nonce",
+        );
+        return sendJson(res, nonceResult.status ?? 409, {
+          error: "nonce_replayed",
+          code: nonceResult.code ?? "SIGNATURE_REPLAYED",
+          message: nonceResult.message ?? "Request nonce has already been used.",
+        });
+      }
+      // A fresh server nonce is attached to every accepted response so a
+      // client can chain requests without reusing a nonce.
+      if (nonceResult.serverNonce) {
+        res.setHeader("X-Nonce", nonceResult.serverNonce);
+      }
+    }
+
     // HMAC request signing (#752). Verified before routing so no handler can
     // act on a request whose body was tampered with or replayed. Operational
     // endpoints are exempt for the same reason they skip rate limiting: a
@@ -391,7 +637,7 @@ export function createApp({
           ? await apiKeyService.getSigningSecret(signingKeyId)
           : null;
 
-        const verdict = verifySignedRequest({
+        const verdict = await verifySignedRequest({
           headers: req.headers,
           method: req.method,
           path: req.url,
@@ -494,12 +740,52 @@ export function createApp({
       }
     }
 
+    // #1053: resolve the tenant before quota/limit checks so per-tenant
+    // budgets apply. The tenant registry is the source of truth for limits.
+    const tenant = tenantRegistry.getTenant(tenantId) ?? null;
+    req.tenant = tenant;
+    if (tenant) {
+      const tenantLimits = tenant.limits ?? {};
+      if (
+        tenantLimits.maxCredentials != null &&
+        req.method === "POST" &&
+        (pathname === "/credentials" || pathname === "/credentials/issue")
+      ) {
+        const existing = await readCredentials(config, { tenantId });
+        if (existing.length >= tenantLimits.maxCredentials) {
+          return sendJson(res, 429, {
+            error: "tenant_limit_exceeded",
+            code: "TENANT_LIMIT_EXCEEDED",
+            scope: "credentials",
+            tenantId,
+            message: `Tenant '${tenantId}' has reached its credential limit (${tenantLimits.maxCredentials}).`,
+          });
+        }
+      }
+      if (
+        tenantLimits.maxDids != null &&
+        req.method === "POST" &&
+        pathname === "/admin/issuers"
+      ) {
+        const issuers = await soroban.getIssuers();
+        if (issuers.length >= tenantLimits.maxDids) {
+          return sendJson(res, 429, {
+            error: "tenant_limit_exceeded",
+            code: "TENANT_LIMIT_EXCEEDED",
+            scope: "dids",
+            tenantId,
+            message: `Tenant '${tenantId}' has reached its DID limit (${tenantLimits.maxDids}).`,
+          });
+        }
+      }
+    }
+
     // Quota check (#748): a separate budget from the rate limit above,
     // measured against calendar day/month boundaries rather than a rolling
     // window. GET /quota itself is exempt so checking your own usage never
     // consumes it.
     if (!isExempt && pathname !== "/quota") {
-      const quotaResult = quota.consume(req);
+      const quotaResult = quota.consume(req, tenant ? { tenantId, limits: tenant.limits } : undefined);
       const binding = pickQuotaBinding(quotaResult);
       res.setHeader("X-Quota-Tier", quotaResult.tier);
       res.setHeader("X-Quota-Period", binding.period);
@@ -521,23 +807,33 @@ export function createApp({
       }
     }
 
-    return requestContextStore.run({ ...(requestContextStore.getStore() || {}), requestId, tenantId }, async () => {
-      try {
-        if (req.method === "GET" && pathname === "/info") {
-          return sendJson(res, 200, {
-            version: SERVER_VERSION,
-            apiVersion: version,
-            supportedVersions: SUPPORTED_VERSIONS,
-            features: SERVER_FEATURES,
-            minSdkVersion: MIN_SDK_VERSION,
-          });
+        const linkPrefix = resolveLinkPrefix({ version, isExplicitUrlVersion });
+
+        if (req.method === "GET" && (pathname === "/" || pathname === "/info")) {
+          const rootLinks = buildApiRootLinks(linkPrefix);
+          return sendJson(
+            res,
+            200,
+            {
+              version: SERVER_VERSION,
+              apiVersion: version,
+              supportedVersions: SUPPORTED_VERSIONS,
+              features: SERVER_FEATURES,
+              minSdkVersion: MIN_SDK_VERSION,
+              encryption: {
+                enabled: isEncryptionEnabled(config),
+                algorithm: "aes-256-gcm",
+                keyExchange: "/encryption/session",
+                rotation: "/encryption/rotate",
+                keyIdHeader: ENCRYPTION_KEY_ID_HEADER,
+                encryptedFields: ["claims", "subject", "credentialSubject"],
+              },
+              _links: rootLinks,
+            },
+            { Link: formatLinkHeader(rootLinks) },
+          );
         }
 
-        if (req.method === "GET" && url.pathname === "/health") {
-          const contracts = await soroban.pingAllContracts();
-          const ok = Object.values(contracts).every(Boolean);
-          return sendFormatted(req, res, ok ? 200 : 503, {
-            status: ok ? "ok" : "degraded",
         // CSP violation reports (#754). Unauthenticated by necessity — the
         // browser posts these on its own behalf, with no credentials — so the
         // handler only ever logs and counts, and never trusts the contents.
@@ -607,9 +903,6 @@ export function createApp({
           });
         }
 
-        if (req.method === 'GET' && url.pathname === '/metrics') {
-          if (metricsAggregator) await metricsAggregator.refresh().catch((error) => logger.error('metrics refresh failed', error));
-          return sendText(res, 200, metrics.renderPrometheus());
         if (req.method === "GET" && pathname === "/ready") {
           const readiness = await collectReadiness({
             config,
@@ -666,12 +959,6 @@ export function createApp({
           return sendText(res, 200, body, metrics.contentType ? { "content-type": metrics.contentType } : {});
         }
 
-        // #390: paginated credential list
-        if (req.method === "GET" && url.pathname === "/credentials") {
-          const limitParam = url.searchParams.get("limit") ?? "50";
-          const limitNum = Number.parseInt(limitParam, 10) || 50;
-          if (limitNum > 200) {
-            return sendFormatted(req, res, 400, { code: "INVALID_REQUEST", message: "limit must not exceed 200" });
         // ── GraphQL Endpoint ─────────────────────────────────────────
         if (pathname === "/graphql") {
           if (req.method === "GET") {
@@ -733,23 +1020,14 @@ export function createApp({
           });
           if (!validated.ok) return;
           const limitNum = validated.data.query.limit ?? 50;
-          const credentials = await readCredentials(config);
+          const direction = validated.data.query.direction ?? "next";
+          const credentials = await readCredentials(config, { tenantId });
           const { items, nextCursor, previousCursor, pagination } = cursorPage(credentials, {
             limit: limitNum,
             cursor: validated.data.query.cursor ?? null,
             direction,
           });
-          // #958: has_more follows the direction of travel.
-          const pagination = buildPaginationMeta({
-            totalCount: credentials.length,
-            pageSize: Math.min(200, Math.max(1, limitNum)),
-            hasMore: direction === "prev" ? Boolean(previousCursor) : Boolean(nextCursor),
-            nextCursor,
-            previousCursor,
-            extraLinkParams: { prev: { direction: "prev" } },
-          });
           setPaginationHeaders(res, url, pagination);
-          return sendFormatted(req, res, 200, { items, nextCursor, pagination });
 
           if (wantsJsonLd(req, url)) {
             return sendJson(
@@ -785,6 +1063,20 @@ export function createApp({
             return res.writeHead(304).end();
           }
 
+          const collectionLinks = buildCredentialCollectionLinks({
+            prefix: linkPrefix,
+            limit: limitNum,
+            nextCursor,
+            previousCursor,
+          });
+          const hasFieldsFilter = Boolean(validated.data.query?.fields);
+          const itemsWithLinks = hasFieldsFilter
+            ? projectedItems
+            : projectedItems.map((item) => ({
+                ...item,
+                _links: buildCredentialLinks(item, linkPrefix),
+              }));
+
           if (version === "v2") {
             return sendJson(
               res,
@@ -792,7 +1084,7 @@ export function createApp({
               {
                 apiVersion: "v2",
                 data: {
-                  items: projectedItems,
+                  items: itemsWithLinks,
                   pageInfo: {
                     nextCursor,
                     previousCursor,
@@ -805,6 +1097,7 @@ export function createApp({
                 meta: {
                   timestamp: new Date().toISOString(),
                 },
+                _links: collectionLinks,
               },
               { ETag: collectionEtag },
             );
@@ -812,13 +1105,13 @@ export function createApp({
           return sendJson(
             res,
             200,
-            { items: projectedItems, nextCursor, previousCursor, pagination },
+            { items: itemsWithLinks, nextCursor, previousCursor, pagination, _links: collectionLinks },
             { ETag: collectionEtag },
           );
         }
 
         // Single-item GET /credentials/:id. #745: strong ETag + conditional
-        // GET. #747: optional `?fields=` projection.
+        // GET. #747: optional `?fields=` projection. #1069: HATEOAS _links.
         const credentialIdMatch = pathname.match(/^\/credentials\/([^/]+)$/);
         if (req.method === "GET" && credentialIdMatch) {
           const credentialId = decodeURIComponent(credentialIdMatch[1]);
@@ -827,11 +1120,9 @@ export function createApp({
             query: url.searchParams,
           });
           if (!validated.ok) return;
-          const credentials = await readCredentials(config);
+          const credentials = await readCredentials(config, { tenantId });
           const credential = credentials.find((c) => c.id === credentialId);
           if (!credential) return notFound(res, req);
-          return sendFormatted(req, res, 200, credential);
-          if (!credential) return notFound(res);
 
           // W3C JSON-LD form (#753), opt-in so existing clients keep the
           // compact internal shape they already parse. Requested either by
@@ -869,15 +1160,20 @@ export function createApp({
             return res.writeHead(304).end();
           }
 
+          const itemLinks = buildCredentialLinks(credential, linkPrefix);
+          const payloadWithLinks = validated.data.query?.fields
+            ? projectedCredential
+            : { ...projectedCredential, _links: itemLinks };
+
           if (version === "v2") {
             return sendJson(
               res,
               200,
-              { apiVersion: "v2", data: projectedCredential },
-              { ETag: etag },
+              { apiVersion: "v2", data: payloadWithLinks, _links: itemLinks },
+              { ETag: etag, Link: formatLinkHeader(itemLinks) },
             );
           }
-          return sendJson(res, 200, projectedCredential, { ETag: etag });
+          return sendJson(res, 200, payloadWithLinks, { ETag: etag, Link: formatLinkHeader(itemLinks) });
         }
 
         // Credential status (#753). Referenced by every credential's
@@ -889,17 +1185,74 @@ export function createApp({
           if (!validateRequest(res, schemas.credentialByIdParams, { params: { credentialId } }).ok) {
             return;
           }
-          const credentials = await readCredentials(config);
+          const credentials = await readCredentials(config, { tenantId });
           const credential = credentials.find((c) => c.id === credentialId);
           if (!credential) return notFound(res);
 
           const status = credentialStatus(credential);
+          const statusLinks = buildCredentialLinks(credential, linkPrefix);
           return sendJson(res, 200, {
             id: `${pathname}`,
             type: CREDENTIAL_STATUS_TYPE,
             credentialId,
             ...status,
             checkedAt: new Date().toISOString(),
+            _links: {
+              ...statusLinks,
+              self: { href: `${linkPrefix}${pathname}`, method: "GET" },
+              credential: { href: `${linkPrefix}/credentials/${encodeURIComponent(credentialId)}`, method: "GET" },
+            },
+          });
+        }
+
+        // Encrypted credential payload (#1049). Returns only the sensitive
+        // fields, encrypted with the caller's session key, so a client can
+        // fetch credential material without it ever appearing in plaintext
+        // on the wire.
+        const encryptedCredentialMatch = pathname.match(/^\/credentials\/([^/]+)\/encrypted$/);
+        if (req.method === "GET" && encryptedCredentialMatch) {
+          if (!await requireAuth(req, res, config, ['credentials:read'])) return;
+          const credentialId = decodeURIComponent(encryptedCredentialMatch[1]);
+          if (!validateRequest(res, schemas.credentialByIdParams, { params: { credentialId } }).ok) {
+            return;
+          }
+          const keyId = req.headers[ENCRYPTION_KEY_ID_HEADER] ?? null;
+          if (!keyId || !encryptionKeys.has(keyId)) {
+            return sendJson(res, 400, {
+              error: "missing_session_key",
+              code: "MISSING_SESSION_KEY",
+              message: `Negotiate a session key at POST /encryption/session and send it in the ${ENCRYPTION_KEY_ID_HEADER} header.`,
+            });
+          }
+          const credentials = await readCredentials(config);
+          const credential = credentials.find((c) => c.id === credentialId);
+          if (!credential) return notFound(res, req);
+
+          const sensitive = {
+            claims: credential.claims ?? null,
+            subject: credential.subject ?? null,
+            credentialSubject: credential.credentialSubject ?? null,
+          };
+          const encrypted = encryptSensitiveResponseFields(sensitive, {
+            registry: encryptionKeys,
+            keyId,
+          });
+          if (!encrypted) {
+            return sendJson(res, 500, {
+              error: "encryption_failed",
+              code: "ENCRYPTION_FAILED",
+              message: "Unable to encrypt the credential payload.",
+            });
+          }
+          res.setHeader(ENCRYPTION_KEY_ID_HEADER, encrypted.keyId);
+          return sendJson(res, 200, {
+            credentialId,
+            algorithm: encrypted.algorithm,
+            keyId: encrypted.keyId,
+            iv: encrypted.iv,
+            tag: encrypted.tag,
+            ciphertext: encrypted.ciphertext,
+            encryptedAt: new Date().toISOString(),
           });
         }
 
@@ -912,35 +1265,25 @@ export function createApp({
           if (!validateRequest(res, schemas.credentialByIdParams, { params: { credentialId } }).ok) {
             return;
           }
-          const credentials = await readCredentials(config);
+          const credentials = await readCredentials(config, { tenantId });
           const credential = credentials.find((c) => c.id === credentialId);
           const recordVerification = (result) =>
             metrics?.observeCredentialVerification?.(result);
           if (!credential) {
+            recordVerification("not_found");
             return sendFormatted(req, res, 200, { verified: false, reason: "not_found" });
           }
           if (credential.revoked) {
+            recordVerification("revoked");
             return sendFormatted(req, res, 200, { verified: false, reason: "revoked" });
           }
           const now = Math.floor(Date.now() / 1000);
           if (credential.expiresAt > 0 && credential.expiresAt < now) {
+            recordVerification("expired");
             return sendFormatted(req, res, 200, { verified: false, reason: "expired" });
           }
-          return sendFormatted(req, res, 200, { verified: true, credential });
-            recordVerification("not_found");
-            return sendJson(res, 200, { verified: false, reason: "not_found" });
-          }
-          if (credential.revoked) {
-            recordVerification("revoked");
-            return sendJson(res, 200, { verified: false, reason: "revoked" });
-          }
-          const now = Math.floor(Date.now() / 1000);
-          if (credential.expiresAt > 0 && credential.expiresAt < now) {
-            recordVerification("expired");
-            return sendJson(res, 200, { verified: false, reason: "expired" });
-          }
           recordVerification("verified");
-          return sendJson(res, 200, { verified: true, credential });
+          return sendFormatted(req, res, 200, { verified: true, credential });
         }
 
         // Interactive Swagger UI (#830)
@@ -1112,7 +1455,7 @@ export function createApp({
 
         // Request traces API and dashboard (#946)
         if (pathname.startsWith("/admin/traces")) {
-          if (!requireAuth(req, res, config, ['admin:read'])) return;
+          if (!await requireAuth(req, res, config, ['admin:read'])) return;
           if (handleTraceRoutes(req, res, { pathname, searchParams: url.searchParams }, { sendJson, nonce: req.cspNonce })) return;
         }
 
@@ -1128,14 +1471,14 @@ export function createApp({
 
         // Analytics Dashboard
         if (req.method === "GET" && url.pathname === "/admin/analytics/dashboard") {
-          if (!requireAuth(req, res, config, ['admin:read'])) return;
+          if (!await requireAuth(req, res, config, ['admin:read'])) return;
           res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
           return res.end(analytics.renderDashboardHtml());
         }
 
         // Analytics Export (CSV or JSON)
         if (req.method === "GET" && url.pathname === "/admin/analytics/export") {
-          if (!requireAuth(req, res, config, ['admin:read'])) return;
+          if (!await requireAuth(req, res, config, ['admin:read'])) return;
           const format = url.searchParams.get("format")?.toLowerCase();
           if (format === "json" || req.headers["accept"] === "application/json") {
             return sendFormatted(req, res, 200, analytics.exportJson(), {
@@ -1151,22 +1494,10 @@ export function createApp({
 
         // Analytics Summary Data
         if (req.method === "GET" && url.pathname === "/admin/analytics") {
-          if (!requireAuth(req, res, config, ['admin:read'])) return;
+          if (!await requireAuth(req, res, config, ['admin:read'])) return;
           return sendFormatted(req, res, 200, analytics.getSummary());
         }
 
-        if (req.method === "POST" && url.pathname === "/credentials") {
-          if (!requireAuth(req, res, config, ['credentials:write'])) return;
-          if (validateContentType(req, res)) return;
-          const body = await readJson(req, config);
-          if (body.__payloadTooLarge)
-            return sendFormatted(req, res, 413, { code: "PAYLOAD_TOO_LARGE", message: "Request body exceeds the size limit." });
-          if (!body.id)
-            return sendFormatted(req, res, 400, { code: "INVALID_REQUEST", message: "Request body must include a credential id." });
-          try {
-            const updated = await createAndPersistCredential(config, body);
-            await appendAuditLog(config, { action: "issue_credential", credentialId: body.id });
-            return sendFormatted(req, res, 201, body);
         if (req.method === "POST" && (pathname === "/credentials" || pathname === "/credentials/issue")) {
           if (!await requireAuth(req, res, config, ['credentials:write'])) return;
           if (validateContentType(req, res)) return;
@@ -1177,7 +1508,7 @@ export function createApp({
           if (!validated.ok) return;
           const credential = validated.data.body;
           try {
-            await createAndPersistCredential(config, credential);
+            await createAndPersistCredential(config, credential, { tenantId });
             await appendAuditLog(config, { action: "issue_credential", credentialId: credential.id });
             webhookService.trigger("credential.issued", credential).catch(() => {});
             realtime?.emitCredentialEvent("issued", credential);
@@ -1189,7 +1520,16 @@ export function createApp({
                 { "content-type": "application/ld+json; charset=utf-8" },
               );
             }
-            return sendJson(res, 201, credential);
+            const createdLinks = buildCredentialLinks(credential, linkPrefix);
+            return sendJson(
+              res,
+              201,
+              { ...credential, _links: createdLinks },
+              {
+                Location: createdLinks.self?.href ?? `/credentials/${encodeURIComponent(credential.id)}`,
+                Link: formatLinkHeader(createdLinks),
+              },
+            );
           } catch (err) {
             if (err instanceof DuplicateCredentialError) {
               return sendFormatted(req, res, 409, {
@@ -1217,7 +1557,7 @@ export function createApp({
           // it, and this request was built from the stale copy.
           const ifMatch = req.headers["if-match"];
           if (ifMatch) {
-            const existing = (await readCredentials(config)).find((c) => c.id === credentialId);
+            const existing = (await readCredentials(config, { tenantId })).find((c) => c.id === credentialId);
             if (!existing) return notFound(res);
             if (!matchesIfMatch(ifMatch, computeEtag(existing))) {
               return sendJson(res, 412, {
@@ -1227,12 +1567,22 @@ export function createApp({
             }
           }
 
-          const revoked = await revokeAndPersistCredential(config, credentialId);
+          const revoked = await revokeAndPersistCredential(config, credentialId, { tenantId });
           if (!revoked) return notFound(res);
           await appendAuditLog(config, { action: "revoke_credential", credentialId });
           webhookService.trigger("credential.revoked", { id: credentialId, revokedAt: revoked.revokedAt }).catch(() => {});
           realtime?.emitCredentialEvent("revoked", revoked);
-          return sendJson(res, 200, { revoked: true, credential: revoked });
+          const revokedLinks = buildCredentialLinks(revoked, linkPrefix);
+          return sendJson(
+            res,
+            200,
+            {
+              revoked: true,
+              credential: { ...revoked, _links: revokedLinks },
+              _links: revokedLinks,
+            },
+            { Link: formatLinkHeader(revokedLinks) },
+          );
         }
 
         // Credential update: PUT /credentials/:id or PATCH /credentials/:id with optimistic concurrency
@@ -1252,7 +1602,7 @@ export function createApp({
             : (body.version ?? body.expectedVersion);
 
           try {
-            const updated = await updateAndPersistCredential(config, credentialId, body, expectedVersion);
+            const updated = await updateAndPersistCredential(config, credentialId, body, expectedVersion, { tenantId });
             if (!updated) return notFound(res);
             await appendAuditLog(config, { action: "update_credential", credentialId });
             webhookService.trigger("credential.updated", updated).catch(() => {});
@@ -1327,6 +1677,7 @@ export function createApp({
           if (!await requireAuth(req, res, config, ['admin:read'])) return;
           const validated = validateRequest(res, schemas.webhookLogsQuery, { query: url.searchParams });
           if (!validated.ok) return;
+          const limit = validated.data.query.limit ?? 50;
           const webhookId = validated.data.query.webhookId ?? null;
           const allLogs = await readWebhookLogs(config, { webhookId, limit: null });
           const { items: logs, pagination } = offsetPage(allLogs, {
@@ -1372,6 +1723,120 @@ export function createApp({
           const did = decodeURIComponent(cacheDidMatch[1]);
           const invalidated = didCache ? await didCache.invalidate(did) : false;
           return sendJson(res, 200, { did, invalidated });
+        }
+
+        // ── DID Resolution & Metadata Endpoints (#1067) ────────────────
+        if (req.method === "POST" && (pathname === "/dids" || pathname === "/identity/did")) {
+          // These writes land in the DID cache, which resolveDid() reads
+          // before the chain, so an unauthenticated write could poison any
+          // DID's resolved document.
+          if (!await requireAuth(req, res, config, ["admin:write"])) return;
+          if (validateContentType(req, res)) return;
+          const body = await readJson(req, config);
+          if (body.__payloadTooLarge) {
+            return sendJson(res, 413, { code: "PAYLOAD_TOO_LARGE", message: "Request body exceeds the size limit." });
+          }
+          const validated = validateRequest(res, schemas.upsertDid, { body });
+          if (!validated.ok) return;
+          const rawIdentifier = validated.data.body.did ?? validated.data.body.address ?? "";
+          if (!rawIdentifier) {
+            return sendJson(res, 400, {
+              error: "validation_failed",
+              code: "VALIDATION_FAILED",
+              message: "Either did or address is required.",
+            });
+          }
+          const address = rawIdentifier.startsWith("did:stellar:")
+            ? rawIdentifier.slice("did:stellar:".length)
+            : rawIdentifier;
+          const safeMetadata = sanitizeDidMetadata(body.metadata ?? validated.data.body.metadata ?? {});
+          const nowSec = Math.floor(Date.now() / 1000);
+          const didDoc = {
+            id: `did:stellar:${address}`,
+            controller: validated.data.body.controller ?? `did:stellar:${address}`,
+            createdAt: nowSec,
+            updatedAt: nowSec,
+            metadata: safeMetadata,
+            active: validated.data.body.active !== false,
+          };
+          if (didCache) {
+            await didCache.set(address, didDoc);
+          }
+          const didLinks = buildDidLinks(didDoc, linkPrefix);
+          return sendJson(
+            res,
+            pathname === "/identity/did" ? 200 : 201,
+            { ...didDoc, _links: didLinks },
+            { Link: formatLinkHeader(didLinks) },
+          );
+        }
+
+        const didRouteMatch = pathname.match(/^\/dids\/([^/]+)(\/metadata)?$/);
+        if (didRouteMatch) {
+          let rawDid;
+          try {
+            rawDid = decodeURIComponent(didRouteMatch[1]);
+          } catch {
+            return sendJson(res, 400, { code: "INVALID_DID", message: "Malformed URL-encoded DID parameter." });
+          }
+          const address = rawDid.startsWith("did:stellar:") ? rawDid.slice("did:stellar:".length) : rawDid;
+
+          if (req.method === "GET") {
+            const doc = soroban?.resolveDid ? await soroban.resolveDid(address) : null;
+            if (!doc) return notFound(res, req);
+            const didLinks = buildDidLinks(doc, linkPrefix);
+            return sendJson(
+              res,
+              200,
+              {
+                ...doc,
+                metadata: sanitizeDidMetadata(doc.metadata ?? {}),
+                _links: didLinks,
+              },
+              { Link: formatLinkHeader(didLinks) },
+            );
+          }
+
+          if (req.method === "PUT" || req.method === "PATCH") {
+            // Same cache-poisoning risk as POST /dids above.
+            if (!await requireAuth(req, res, config, ["admin:write"])) return;
+            if (validateContentType(req, res)) return;
+            const body = await readJson(req, config);
+            if (body.__payloadTooLarge) {
+              return sendJson(res, 413, { code: "PAYLOAD_TOO_LARGE", message: "Request body exceeds the size limit." });
+            }
+            const rawMetadata = body.metadata !== undefined ? body.metadata : body;
+            if (!rawMetadata || typeof rawMetadata !== "object" || Array.isArray(rawMetadata)) {
+              return sendJson(res, 400, {
+                error: "validation_failed",
+                code: "VALIDATION_FAILED",
+                message: "DID metadata must be a JSON object.",
+              });
+            }
+            const safeMetadata = sanitizeDidMetadata(rawMetadata);
+            const existing = (soroban?.resolveDid ? await soroban.resolveDid(address) : null) ?? {
+              id: `did:stellar:${address}`,
+              controller: `did:stellar:${address}`,
+              createdAt: Math.floor(Date.now() / 1000),
+              active: true,
+              metadata: {},
+            };
+            const updatedDoc = {
+              ...existing,
+              updatedAt: Math.floor(Date.now() / 1000),
+              metadata: req.method === "PATCH" ? { ...(existing.metadata ?? {}), ...safeMetadata } : safeMetadata,
+            };
+            if (didCache) {
+              await didCache.set(address, updatedDoc);
+            }
+            const didLinks = buildDidLinks(updatedDoc, linkPrefix);
+            return sendJson(
+              res,
+              200,
+              { ...updatedDoc, _links: didLinks },
+              { Link: formatLinkHeader(didLinks) },
+            );
+          }
         }
 
         if (req.method === "GET" && pathname === "/notifications/summary") {
@@ -1457,10 +1922,6 @@ export function createApp({
           const body = await readJson(req, config);
           if (body.__payloadTooLarge)
             return sendFormatted(req, res, 413, { error: "payload_too_large" });
-          if (!body.issuer)
-            return sendFormatted(req, res, 400, { error: "issuer_required" });
-          await soroban.addIssuer(body.issuer);
-            return sendJson(res, 413, { error: "payload_too_large" });
           const validated = validateRequest(res, schemas.addIssuer, { body });
           if (!validated.ok) return;
           const { issuer } = validated.data.body;
@@ -1472,7 +1933,6 @@ export function createApp({
             issuer,
           });
           return sendFormatted(req, res, 201, { issuer: body.issuer });
-          return sendJson(res, 201, { issuer });
         }
 
         if (req.method === "DELETE" && pathname === "/admin/issuers") {
@@ -1482,9 +1942,6 @@ export function createApp({
           const body = await readJson(req, config);
           if (body.__payloadTooLarge)
             return sendFormatted(req, res, 413, { error: "payload_too_large" });
-          const issuer = body.issuer ?? url.searchParams.get("issuer");
-          if (!issuer) return sendFormatted(req, res, 400, { error: "issuer_required" });
-            return sendJson(res, 413, { error: "payload_too_large" });
           const validated = validateRequest(res, schemas.removeIssuer, {
             body,
             query: url.searchParams,
@@ -1525,7 +1982,7 @@ export function createApp({
           });
           if (!validated.ok) return;
           const windowDays = validated.data.query.windowDays ?? config.expiryWarningDays;
-          const credentials = await readCredentials(config);
+          const credentials = await readCredentials(config, { tenantId });
           const expiring = findExpiringCredentials(credentials, {
             windowDays,
             includeNotified: true,
@@ -1539,7 +1996,6 @@ export function createApp({
           return sendFormatted(req, res, 200, { ...report, pagination });
         }
 
-        return notFound(res, req);
         if (req.method === "GET" && (url.pathname === "/admin/expiry-thresholds" || url.pathname === "/expiry/thresholds")) {
           if (!await requireAuth(req, res, config, ['admin:read'])) return;
           return sendJson(res, 200, {
@@ -1606,12 +2062,17 @@ export function createApp({
         if (req.method === "GET" && url.pathname === "/admin/api-keys") {
           if (!await requireAuth(req, res, config, ['admin:read'])) return;
           const keys = await apiKeyService.listKeys();
-          const page = paginateArray(keys, {
-            pageSize: url.searchParams.get("limit"),
+          const page = cursorPage(keys, {
+            limit: url.searchParams.get("limit"),
             cursor: url.searchParams.get("cursor"),
           });
-          setPaginationHeaders(res, url, page.meta);
-          return sendJson(res, 200, { keys: page.items, pagination: page.meta });
+          setPaginationHeaders(res, url, page.pagination);
+          return sendJson(res, 200, {
+            keys: page.items,
+            nextCursor: page.nextCursor,
+            previousCursor: page.previousCursor,
+            pagination: page.pagination,
+          });
         }
 
         const apiKeyIdMatch = url.pathname.match(/^\/admin\/api-keys\/([^/]+)$/);
@@ -1801,6 +2262,42 @@ export function createApp({
           }
         }
 
+        // Session key lifecycle (#1049): a client can inspect and drop the
+        // keys it negotiated without going through the admin surface.
+        if (req.method === "GET" && pathname === "/encryption/keys") {
+          const keyId = req.headers[ENCRYPTION_KEY_ID_HEADER] ?? null;
+          if (!keyId) {
+            return sendJson(res, 400, {
+              error: "missing_key_id",
+              code: "MISSING_KEY_ID",
+              message: `Provide the session key id in the ${ENCRYPTION_KEY_ID_HEADER} header.`,
+            });
+          }
+          const key = encryptionKeys.describe(keyId);
+          if (!key) {
+            return sendJson(res, 404, {
+              error: "unknown_key_id",
+              code: "UNKNOWN_KEY_ID",
+              message: "The supplied session key id is unknown or has expired.",
+            });
+          }
+          return sendJson(res, 200, key);
+        }
+
+        if (req.method === "DELETE" && pathname === "/encryption/keys") {
+          const keyId = req.headers[ENCRYPTION_KEY_ID_HEADER] ?? null;
+          if (!keyId) {
+            return sendJson(res, 400, {
+              error: "missing_key_id",
+              code: "MISSING_KEY_ID",
+              message: `Provide the session key id in the ${ENCRYPTION_KEY_ID_HEADER} header.`,
+            });
+          }
+          const revoked = encryptionKeys.revoke(keyId);
+          if (!revoked) return notFound(res);
+          return sendJson(res, 200, { revoked: true, keyId });
+        }
+
         // Multi-tenant administration and provisioning endpoints (#800)
         if (handleTenantRoutes(req, res, url, tenantRegistry, (entry) => appendAuditLog(config, entry))) {
           return;
@@ -1812,13 +2309,8 @@ export function createApp({
         }
 
         return notFound(res);
-      } catch (error) {
-        if (error.name === 'SorobanError') {
-          logger.error(error.internalDetail);
-          return sendJson(res, 500, { error: error.category, message: error.publicMessage });
-        }
-        logger.error(error);
-        return sendJson(res, 500, { error: 'internal_server_error', message: error.message });
+    };
+    return dedupe(req, res, () => requestContextStore.run({ requestId, correlationId, tenantId }, handler), config).catch((error) => {
         if (error.name === "SorobanError" || error.name === "SorobanUnavailableError") {
           const isUnavailable = error.name === "SorobanUnavailableError" || error.category === "rpc_unavailable";
           const statusCode = isUnavailable ? 503 : 500;
@@ -1838,7 +2330,6 @@ export function createApp({
           error: "internal_server_error",
           message: error.message,
         });
-      }
     });
   };
 }

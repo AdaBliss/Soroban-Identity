@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { logger } from './logger.js';
+import { getClientAddress, isAdminIpAllowed } from './ip-whitelist.js';
 
 /**
  * Constant-time string comparison using crypto.timingSafeEqual.
@@ -99,7 +100,24 @@ export async function readJson(req, config) {
   if (buffer.length === 0) return {};
   const raw = buffer.toString("utf8");
   if (!raw.trim()) return {};
-  const parsed = JSON.parse(raw);
+  const wellFormed =
+    typeof raw.toWellFormed === "function"
+      ? raw.toWellFormed()
+      : raw.replace(
+          /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g,
+          "\uFFFD",
+        );
+  let parsed;
+  try {
+    parsed = JSON.parse(wellFormed);
+  } catch {
+    // Replace unescaped C0 control characters (excluding \t, \n, \r) that crash JSON.parse (#1067)
+    // eslint-disable-next-line no-control-regex
+    const escaped = wellFormed.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, (ch) =>
+      `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`,
+    );
+    parsed = JSON.parse(escaped);
+  }
   // Stashed for the access log, which runs on response finish and would
   // otherwise have no way to see a body that was already consumed here.
   req.loggedBody = parsed;
@@ -391,17 +409,38 @@ export function notFound(res, req = null) {
  * @param {string[]} requiredScopes - Array of required scopes (e.g., ['credentials:write'])
  * @returns {boolean} True if authenticated and authorized, false otherwise
  */
-export function requireAuth(req, res, config, requiredScopes = []) {
-  if (!config.adminApiKey) {
-    sendFormatted(req, res, 503, { 
-      error: "admin_api_key_not_configured",
-      code: "SERVICE_UNAVAILABLE",
-      message: "API key authentication is not configured"
-    });
+export async function requireAuth(req, res, config, requiredScopes = []) {
+  let pathname = "";
+  try {
+    pathname = new URL(req.url ?? "/", "http://localhost").pathname;
+  } catch {
+    pathname = "";
+  }
+  const isAdminRequest =
+    pathname === "/admin" || pathname.startsWith("/admin/") ||
+    requiredScopes.some((scope) => scope.startsWith("admin:"));
+  if (isAdminRequest && !isAdminIpAllowed(req, config)) {
+    const allowlist = config.adminIpAllowlist ?? [];
+    if (allowlist.length === 0 && config.adminIpAllowlistRequired === true) {
+      sendFormatted(req, res, 503, {
+        error: "admin_ip_allowlist_not_configured",
+        code: "ADMIN_IP_ALLOWLIST_NOT_CONFIGURED",
+        message: "Admin access is disabled until ADMIN_IP_ALLOWLIST is configured",
+      });
+    } else {
+      sendFormatted(req, res, 403, {
+        error: "admin_ip_not_allowed",
+        code: "ADMIN_IP_NOT_ALLOWED",
+        message: "This client address is not permitted to access admin endpoints",
+      });
+    }
+    logger.warn(
+      { clientIp: getClientAddress(req, config.trustProxy === true), pathname },
+      "Blocked admin request from a non-allowlisted IP address",
+    );
     return false;
   }
-  
-export async function requireAuth(req, res, config, requiredScopes = []) {
+
   const token =
     req.headers["x-api-key"] ||
     req.headers.authorization?.replace(/^Bearer\s+/i, "");

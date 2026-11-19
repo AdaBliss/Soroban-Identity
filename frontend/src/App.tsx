@@ -5,6 +5,12 @@ import LoadingFallback from "./components/LoadingFallback";
 import KeyboardShortcutsModal from "./components/KeyboardShortcutsModal";
 import { useKeyboardShortcuts, useSequentialShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useKeyboardShortcutsContext } from "./context/KeyboardShortcutsContext";
+import ViewTransition from "./components/ViewTransition";
+import VoiceCommandButton from "./components/VoiceCommandButton";
+import { useVoiceCommands, type VoiceCommand } from "./hooks/useVoiceCommands";
+import { CollaborationProvider } from "./collaboration/CollaborationProvider";
+import CollaborationPanel from "./collaboration/CollaborationPanel";
+import { COLLABORATION_CONFIG } from "./config/collaboration";
 
 // Tab panels are route-like application surfaces. Keep the initial identity
 // route small and fetch the credentials route only when it is needed.
@@ -12,6 +18,10 @@ const IdentityPanel = lazy(() => import("./components/IdentityPanel"));
 const CredentialsPanel = lazy(() => import("./components/CredentialsPanel"));
 const IssuerDashboard = lazy(() => import("./pages/IssuerDashboard"));
 const CredentialRecipientVerify = lazy(() => import("./components/CredentialRecipientVerify"));
+const NetworkStatistics = lazy(() => import("./components/NetworkStatistics"));
+const CustomizableDashboard = lazy(() => import("./components/CustomizableDashboard"));
+const PrivacySettings = lazy(() => import("./components/privacy/PrivacySettings"));
+const { isShareLinkExpired } = await import("./components/privacy/shareLinks");
 
 const preloadCredentialsPanel = () => {
   void import("./components/CredentialsPanel");
@@ -19,11 +29,24 @@ const preloadCredentialsPanel = () => {
 const preloadCredentialRecipientVerify = () => {
   void import("./components/CredentialRecipientVerify");
 };
+const preloadNetworkStatistics = () => {
+  void import("./components/NetworkStatistics");
+};
+const preloadCustomizableDashboard = () => {
+  void import("./components/CustomizableDashboard");
+};
+const preloadPrivacySettings = () => {
+  void import("./components/privacy/PrivacySettings");
+};
 import WalletButton from "./components/WalletButton";
+import QRScanner from "./components/QRScanner";
+import { TourProvider, useTour } from "./context/TourContext";
+import TourOverlay from "./components/TourOverlay";
 import ErrorBoundary from "./components/ErrorBoundary";
 import Toast from "./components/Toast";
 import { ToastProvider } from "./context/ToastContext";
 import { useWallet } from "./hooks/useWallet";
+import { useIdleSessionTimeout } from "./hooks/useIdleSessionTimeout";
 import { useCredentialExpiryCheck } from "./hooks/useCredentialExpiryCheck";
 import { useTheme, cycleTheme, getThemeIcon, getThemeLabel } from "./hooks/useTheme";
 import { useServiceWorker } from "./hooks/useServiceWorker";
@@ -52,19 +75,36 @@ export enum Tab {
   Identity = "identity",
   Credentials = "credentials",
   IssuerAnalytics = "issuerAnalytics",
+  NetworkStatistics = "networkStatistics",
+  CredentialAnalytics = "credentialAnalytics",
+  Dashboard = "dashboard",
+  Privacy = "privacy",
 }
 
-const TAB_ORDER: Tab[] = [Tab.Identity, Tab.Credentials, Tab.IssuerAnalytics];
+const TAB_ORDER: Tab[] = [
+  Tab.Identity,
+  Tab.Credentials,
+  Tab.IssuerAnalytics,
+  Tab.NetworkStatistics,
+  Tab.CredentialAnalytics,
+  Tab.Dashboard,
+  Tab.Privacy,
+];
 
-export default function App() {
+function AppContent() {
   const [tab, setTab] = useState<Tab>(Tab.Identity);
   const tabRefs = useRef<Partial<Record<Tab, HTMLButtonElement | null>>>({});
   const [activeNetwork, setActiveNetwork] = useState<NetworkName>(DEFAULT_NETWORK);
   const [verifyId, setVerifyId] = useState<string | null>(null);
   const [scanning, setScanning] = useState(false);
   const [deepLinkEncrypted, setDeepLinkEncrypted] = useState<{ c: string; k: string } | null>(null);
+  // Set when a shared credential link is past its expiry (#1101).
+  const [deepLinkExpired, setDeepLinkExpired] = useState(false);
+  // Credential currently open for collaborative editing (#1105).
+  const [activeCredentialId, setActiveCredentialId] = useState<string | null>(null);
   const networkConfig = NETWORK_CONFIGS[activeNetwork];
   const wallet = useWallet(networkConfig);
+  useIdleSessionTimeout(wallet.connected, wallet.disconnect);
   const [theme, setTheme, isDarkMode] = useTheme();
   const { t, i18n } = useTranslation();
   const [isConnected, setIsConnected] = useState<boolean | null>(null);
@@ -76,6 +116,48 @@ export default function App() {
   // Keyboard shortcuts
   const { enabled: shortcutsEnabled, toggleHelp: toggleShortcutsHelp, showHelp: showShortcutsHelp } = useKeyboardShortcutsContext();
   const searchInputRef = useRef<HTMLInputElement | null>(null);
+
+  // Voice commands (#1046): hands-free search, navigation and verification.
+  const voiceCommands = useMemo<VoiceCommand[]>(
+    () => [
+      {
+        phrases: ["search", "find", "buscar", "rechercher", "搜索"],
+        description: t("voice.commands.search"),
+        handler: () => {
+          searchInputRef.current?.focus();
+        },
+      },
+      {
+        phrases: ["navigate", "go to", "open", "navegar", "aller", "导航"],
+        description: t("voice.commands.navigate"),
+        handler: (transcript: string) => {
+          const target = transcript.toLowerCase();
+          if (target.includes("credential")) {
+            setTab(Tab.Credentials);
+          } else if (target.includes("issuer")) {
+            setTab(Tab.IssuerAnalytics);
+          } else if (target.includes("analytics")) {
+            setTab(Tab.CredentialAnalytics);
+          } else if (target.includes("dashboard")) {
+            setTab(Tab.Dashboard);
+          } else {
+            setTab(Tab.Identity);
+          }
+        },
+      },
+      {
+        phrases: ["verify", "verificar", "vérifier", "验证"],
+        description: t("voice.commands.verify"),
+        handler: () => {
+          setTab(Tab.Credentials);
+          setScanning(true);
+        },
+      },
+    ],
+    [t],
+  );
+
+  const voice = useVoiceCommands({ commands: voiceCommands });
 
   // Mobile nav drawer (#882): while open, focus moves into the drawer and
   // Tab cycles inside it, the page behind does not scroll, and Escape closes
@@ -131,9 +213,31 @@ export default function App() {
     const verifyParam = urlParams.get("verify");
     const cParam = urlParams.get("c");
     const kParam = urlParams.get("k");
+    const expParam = urlParams.get("exp");
+
+    const compareParam = urlParams.get("compare");
+    const shareParam = urlParams.get("share");
+
+    if (compareParam) {
+      const ids = compareParam
+        .split(",")
+        .map((id) => id.trim())
+        .filter(Boolean);
+      if (ids.length > 0) setCompareIds(ids);
+    }
+
+    if (shareParam) {
+      setShareId(shareParam.trim());
+    }
 
     if (cParam && kParam) {
-      setDeepLinkEncrypted({ c: cParam, k: kParam });
+      // Time-limited sharing (#1101): refuse to decrypt claims from a link
+      // whose expiry has passed.
+      if (isShareLinkExpired(expParam)) {
+        setDeepLinkExpired(true);
+      } else {
+        setDeepLinkEncrypted({ c: cParam, k: kParam });
+      }
       setTab(Tab.Credentials);
     } else if (verifyParam) {
       setVerifyId(verifyParam);
@@ -149,6 +253,21 @@ export default function App() {
   useOpenGraphMeta(verifyMeta);
 
   const onMainnet = isMainnet(activeNetwork);
+
+  // The credential being edited is either the one opened via a verification
+  // deep link or the one selected inside the credentials panel.
+  const collaborationCredentialId = activeCredentialId ?? verifyId ?? null;
+  const collaborationUser = useMemo(
+    () =>
+      wallet.publicKey
+        ? {
+            id: wallet.publicKey,
+            name: wallet.publicKey.slice(0, 6),
+            role: COLLABORATION_CONFIG.defaultRole,
+          }
+        : null,
+    [wallet.publicKey],
+  );
 
   // Check RPC connection health on load
   useEffect(() => {
@@ -191,7 +310,7 @@ export default function App() {
     [],
   );
 
-  const { notification, dismiss } = useCredentialExpiryCheck(
+  const { notification, dismiss, markAllAsRead } = useCredentialExpiryCheck(
     wallet.publicKey,
     fetchCredentials,
   );
@@ -380,7 +499,41 @@ export default function App() {
           >
             {getThemeIcon(theme, isDarkMode)} {getThemeLabel(theme, isDarkMode, t)}
           </button>
-          <WalletButton wallet={wallet} />
+          {notification && !notification.dismissed && notification.count > 0 && (
+            <span
+              className="notification-badge-icon"
+              data-testid="notification-badge"
+              aria-label={`${notification.count} notification${notification.count > 1 ? "s" : ""}`}
+              style={{
+                position: "relative",
+                display: "inline-flex",
+                alignItems: "center",
+                gap: "0.25rem",
+                fontSize: "0.85rem",
+                fontWeight: 600,
+              }}
+            >
+              <span aria-hidden="true">🔔</span>
+              <span className="badge badge-yellow" data-testid="notification-badge-count">
+                {notification.count}
+              </span>
+            </span>
+          )}
+          <TourRestartButton />
+          <VoiceCommandButton voice={voice} />
+          <button
+            type="button"
+            className="settings-toggle"
+            aria-label={t("a11y.settings", "Settings")}
+            aria-expanded={settingsOpen}
+            aria-controls="settings-panel"
+            onClick={() => setSettingsOpen((v) => !v)}
+            onMouseEnter={preloadBiometricDeviceManager}
+            onFocus={preloadBiometricDeviceManager}
+          >
+            <span aria-hidden="true">⚙</span>
+          </button>
+          <WalletButton />
         </div>
         <div
           className={`mobile-drawer-backdrop${menuOpen ? " open" : ""}`}
@@ -390,6 +543,38 @@ export default function App() {
       </header>
 
       <OfflineIndicator />
+
+      {settingsOpen && (
+        <section
+          id="settings-panel"
+          aria-label={t("a11y.settings", "Settings")}
+          className="settings-panel"
+        >
+          <Suspense fallback={<LoadingFallback />}>
+            <BiometricDeviceManager />
+          </Suspense>
+        </section>
+      )}
+
+      {shareId && (
+        <Suspense fallback={<LoadingFallback />}>
+          <SharedCredentialVerify
+            shortId={shareId}
+            network={activeNetwork}
+            onClose={() => setShareId(null)}
+          />
+        </Suspense>
+      )}
+
+      {compareIds && (
+        <Suspense fallback={<LoadingFallback />}>
+          <CredentialComparison
+            credentialIds={compareIds}
+            network={activeNetwork}
+            onClose={() => setCompareIds(null)}
+          />
+        </Suspense>
+      )}
 
       {uninitializedContracts.length > 0 && (
         <div
@@ -438,7 +623,7 @@ export default function App() {
         </div>
       )}
 
-      {notification && !notification.dismissed && (
+      {notification && !notification.dismissed && notification.count > 0 && (
         <div
           role="alert"
           style={{
@@ -455,22 +640,43 @@ export default function App() {
           }}
         >
           <span>
-            <span aria-hidden="true">⚠</span> {notification.count} credential
+            <span aria-hidden="true">⚠</span>{" "}
+            <span className="notification-badge" data-testid="notification-badge-count">
+              {notification.count}
+            </span>{" "}
+            credential
             {notification.count > 1 ? "s" : ""} expiring within 7 days
           </span>
-          <button
-            onClick={dismiss}
-            aria-label={t("a11y.dismissNotification")}
-            style={{
-              background: "none",
-              border: "none",
-              cursor: "pointer",
-              fontSize: "1rem",
-              color: "inherit",
-            }}
-          >
-            ✕
-          </button>
+          <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+            <button
+              type="button"
+              onClick={markAllAsRead}
+              style={{
+                background: "none",
+                border: "1px solid currentColor",
+                borderRadius: "0.25rem",
+                padding: "0.2rem 0.5rem",
+                cursor: "pointer",
+                fontSize: "0.8rem",
+                color: "inherit",
+              }}
+            >
+              Mark all as read
+            </button>
+            <button
+              onClick={dismiss}
+              aria-label={t("a11y.dismissNotification")}
+              style={{
+                background: "none",
+                border: "none",
+                cursor: "pointer",
+                fontSize: "1rem",
+                color: "inherit",
+              }}
+            >
+              ✕
+            </button>
+          </div>
         </div>
       )}
 
@@ -495,9 +701,30 @@ export default function App() {
             ref={(node) => {
               tabRefs.current[name] = node;
             }}
+            data-tour={`tab-${name}`}
             onClick={() => setTab(name)}
-            onMouseEnter={name === Tab.Credentials ? preloadCredentialsPanel : undefined}
-            onFocus={name === Tab.Credentials ? preloadCredentialsPanel : undefined}
+            onMouseEnter={
+              name === Tab.Credentials
+                ? preloadCredentialsPanel
+                : name === Tab.NetworkStatistics
+                  ? preloadNetworkStatistics
+                  : name === Tab.Dashboard
+                    ? preloadCustomizableDashboard
+                    : name === Tab.Privacy
+                      ? preloadPrivacySettings
+                      : undefined
+            }
+            onFocus={
+              name === Tab.Credentials
+                ? preloadCredentialsPanel
+                : name === Tab.NetworkStatistics
+                  ? preloadNetworkStatistics
+                  : name === Tab.Dashboard
+                    ? preloadCustomizableDashboard
+                    : name === Tab.Privacy
+                      ? preloadPrivacySettings
+                      : undefined
+            }
           >
             {t(`tabs.${name}`)}
           </button>
@@ -507,10 +734,12 @@ export default function App() {
       <main id="main-content" tabIndex={-1}>
         <ErrorBoundary>
           <Suspense fallback={<LoadingFallback />}>
+          <ViewTransition viewKey={tab}>
           <div
             id={`panel-${Tab.Identity}`}
             role="tabpanel"
             aria-labelledby={`tab-${Tab.Identity}`}
+            data-tour="panel-identity"
             hidden={tab !== Tab.Identity}
           >
             {tab === Tab.Identity && <IdentityPanel />}
@@ -519,10 +748,29 @@ export default function App() {
             id={`panel-${Tab.Credentials}`}
             role="tabpanel"
             aria-labelledby={`tab-${Tab.Credentials}`}
+            data-tour="panel-credentials"
             hidden={tab !== Tab.Credentials}
           >
             {tab === Tab.Credentials && (
               <>
+                {deepLinkExpired && (
+                  <div
+                    role="alert"
+                    aria-label="Shared credential link expired"
+                    style={{
+                      background: "var(--warning-bg, #fff3cd)",
+                      color: "var(--warning-text, #856404)",
+                      border: "1px solid var(--warning-border, #ffc107)",
+                      borderRadius: "0.5rem",
+                      padding: "0.6rem 1rem",
+                      marginBottom: "1rem",
+                      fontSize: "0.9rem",
+                    }}
+                  >
+                    <span aria-hidden="true">⚠</span> This shared credential link has expired and can no
+                    longer be opened. Ask the sender for a new link.
+                  </div>
+                )}
                 {deepLinkEncrypted && (
                   <CredentialRecipientVerify
                     ciphertext={deepLinkEncrypted.c}
@@ -535,14 +783,20 @@ export default function App() {
                 </button>
                 {scanning && (
                   <QRScanner
-                    onVerify={(id) => {
+                    onVerify={(id: string) => {
                       setVerifyId(id);
                       setScanning(false);
                     }}
                     onClose={() => setScanning(false)}
                   />
                 )}
-                <CredentialsPanel verifyId={verifyId} />
+                <CredentialsPanel
+                  verifyId={verifyId}
+                  onSelectCredential={(id: string) => setActiveCredentialId(id)}
+                />
+                {collaborationCredentialId && (
+                  <CollaborationPanel credentialId={collaborationCredentialId} />
+                )}
               </>
             )}
           </div>
@@ -550,14 +804,124 @@ export default function App() {
             id={`panel-${Tab.IssuerAnalytics}`}
             role="tabpanel"
             aria-labelledby={`tab-${Tab.IssuerAnalytics}`}
+            data-tour="panel-issuer"
             hidden={tab !== Tab.IssuerAnalytics}
           >
-            {tab === Tab.IssuerAnalytics && <IssuerDashboard />}
+            {tab === Tab.IssuerAnalytics && (
+              <IssuerDashboard onOpenCustomizableDashboard={() => setTab(Tab.Dashboard)} />
+            )}
           </div>
+          <div
+            id={`panel-${Tab.CredentialAnalytics}`}
+            role="tabpanel"
+            aria-labelledby={`tab-${Tab.CredentialAnalytics}`}
+            data-tour="panel-credential-analytics"
+            hidden={tab !== Tab.CredentialAnalytics}
+          >
+            {tab === Tab.CredentialAnalytics && (
+              <CredentialAnalytics
+                wallet={wallet}
+                network={activeNetwork}
+                networkConfig={networkConfig}
+              />
+            )}
+          </div>
+          <div
+            id={`panel-${Tab.Dashboard}`}
+            role="tabpanel"
+            aria-labelledby={`tab-${Tab.Dashboard}`}
+            data-tour="panel-dashboard"
+            hidden={tab !== Tab.Dashboard}
+          >
+            {tab === Tab.Dashboard && (
+              <CustomizableDashboard
+                wallet={wallet}
+                network={activeNetwork}
+                networkConfig={networkConfig}
+                onNavigate={(target) => {
+                  const next = (Object.values(Tab) as string[]).includes(target)
+                    ? (target as Tab)
+                    : null;
+                  if (next) {
+                    setTab(next);
+                    tabRefs.current[next]?.focus();
+                  }
+                }}
+              />
+            )}
+          </div>
+          <div
+            id={`panel-${Tab.NetworkStatistics}`}
+            role="tabpanel"
+            aria-labelledby={`tab-${Tab.NetworkStatistics}`}
+            data-tour="panel-network"
+            hidden={tab !== Tab.NetworkStatistics}
+          >
+            {tab === Tab.NetworkStatistics && <NetworkStatistics />}
+          </div>
+          <div
+            id={`panel-${Tab.Activity}`}
+            role="tabpanel"
+            aria-labelledby={`tab-${Tab.Activity}`}
+            data-tour="panel-activity"
+            hidden={tab !== Tab.Activity}
+          >
+            {tab === Tab.Activity && (
+              <ActivityFeed network={activeNetwork} publicKey={wallet.publicKey} />
+            )}
+          </div>
+          </ViewTransition>
           </Suspense>
         </ErrorBoundary>
       </main>
     </div>
     </ToastProvider>
+  );
+}
+
+function TourOverlayWrapper() {
+  const { status, path, skip, complete } = useTour();
+  return (
+    <TourOverlay
+      open={status === 'active'}
+      path={path}
+      onClose={(reason) => (reason === 'skipped' ? skip() : complete())}
+    />
+  );
+}
+
+// Header entry point for the guided tour (#1034). Lets users restart the
+// walkthrough at any time; the overlay itself lives at the app root so it can
+// highlight elements across tabs.
+function TourRestartButton() {
+  const { t } = useTranslation();
+  const { status, path, restart } = useTour();
+  return (
+    <button
+      type="button"
+      className="tour-restart-btn"
+      data-tour="tour-restart"
+      onClick={() => restart(path)}
+      disabled={status === 'active'}
+      aria-label={t('tour.restart', 'Restart tour')}
+      title={t('tour.restart', 'Restart tour')}
+    >
+      <span aria-hidden="true">🧭</span> {t('tour.restart', 'Restart tour')}
+    </button>
+  );
+}
+
+export default function App() {
+  return (
+    <TourProvider>
+      <CollaborationProvider
+        websocketUrl={COLLABORATION_CONFIG.websocketUrl}
+        user={null}
+        defaultRole={COLLABORATION_CONFIG.defaultRole}
+      >
+        <AppContent />
+      </CollaborationProvider>
+      <TourOverlayWrapper />
+    </TourProvider>
   );
 }

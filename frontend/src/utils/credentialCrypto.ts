@@ -9,6 +9,157 @@ export interface EncryptedPayload {
   expiresAt: number; // unix timestamp in ms
 }
 
+/**
+ * Payload shape used for server-encrypted sensitive fields in API responses.
+ * The server negotiates a per-session key (see key exchange) and tags each
+ * encrypted field with the id of the key that produced it, enabling key
+ * rotation without breaking in-flight responses.
+ */
+export interface ServerEncryptedField {
+  keyId: string; // id of the negotiated session key used to encrypt this field
+  iv: string; // base64url encoded 12-byte AES-GCM IV
+  ciphertext: string; // base64url encoded AES-GCM ciphertext (includes auth tag)
+}
+
+/**
+ * A negotiated session key as delivered by the key exchange protocol.
+ */
+export interface SessionKey {
+  keyId: string; // opaque identifier, matches ServerEncryptedField.keyId
+  key: string; // base64url encoded raw AES-GCM 256-bit key
+  expiresAt?: number; // unix timestamp in ms, optional rotation hint
+}
+
+const SESSION_KEY_STORAGE = 'soroban_session_keys';
+
+/**
+ * In-memory cache of negotiated session keys, keyed by keyId.
+ * Populated via `registerSessionKey` / `importSessionKeys`.
+ */
+const sessionKeyCache = new Map<string, CryptoKey>();
+
+/**
+ * Import and register a negotiated session key so it can be used to decrypt
+ * server-encrypted fields. Reuses the existing AES-GCM import helper.
+ */
+export async function registerSessionKey(sessionKey: SessionKey): Promise<CryptoKey> {
+  const key = await importEncryptionKey(sessionKey.key);
+  sessionKeyCache.set(sessionKey.keyId, key);
+  return key;
+}
+
+/**
+ * Import and register multiple negotiated session keys at once (e.g. after a
+ * key rotation the server may advertise both the previous and current key).
+ */
+export async function importSessionKeys(sessionKeys: SessionKey[]): Promise<void> {
+  await Promise.all(sessionKeys.map((sessionKey) => registerSessionKey(sessionKey)));
+}
+
+/**
+ * Look up a registered session key by id, importing it from persisted storage
+ * if it is not already cached in memory.
+ */
+async function getSessionKey(keyId: string): Promise<CryptoKey> {
+  const cached = sessionKeyCache.get(keyId);
+  if (cached) {
+    return cached;
+  }
+
+  try {
+    const stored: SessionKey[] = JSON.parse(localStorage.getItem(SESSION_KEY_STORAGE) || '[]');
+    const match = stored.find((entry) => entry.keyId === keyId);
+    if (match) {
+      return await registerSessionKey(match);
+    }
+  } catch (err) {
+    console.warn('Failed to load persisted session keys:', err);
+  }
+
+  throw new Error(`No session key registered for keyId "${keyId}"`);
+}
+
+/**
+ * Persist negotiated session keys so they survive page reloads. Keys are
+ * short-lived and rotated by the server; callers should prune expired entries.
+ */
+export function persistSessionKeys(sessionKeys: SessionKey[]): void {
+  try {
+    localStorage.setItem(SESSION_KEY_STORAGE, JSON.stringify(sessionKeys));
+  } catch (err) {
+    console.warn('Failed to persist session keys:', err);
+  }
+}
+
+/**
+ * Decrypt a single server-encrypted field using the session key identified by
+ * its keyId. Uses authenticated AES-GCM decryption, so tampered ciphertexts
+ * will reject rather than yield corrupted plaintext.
+ */
+export async function decryptServerField<T = unknown>(
+  field: ServerEncryptedField
+): Promise<T> {
+  const key = await getSessionKey(field.keyId);
+  const iv = base64UrlToBuffer(field.iv);
+  const ciphertext = base64UrlToBuffer(field.ciphertext);
+
+  const decrypted = await window.crypto.subtle.decrypt(
+    {
+      name: 'AES-GCM',
+      iv: iv as unknown as BufferSource,
+    },
+    key,
+    ciphertext as unknown as BufferSource
+  );
+
+  const decryptedString = new TextDecoder().decode(decrypted);
+  return JSON.parse(decryptedString) as T;
+}
+
+/**
+ * Decrypt a server-encrypted payload string (base64url encoded JSON of a
+ * ServerEncryptedField) using the negotiated session key it references.
+ */
+export async function decryptServerPayload<T = unknown>(
+  payloadString: string
+): Promise<T> {
+  const jsonStr = new TextDecoder().decode(base64UrlToBuffer(payloadString));
+  const field: ServerEncryptedField = JSON.parse(jsonStr);
+  return decryptServerField<T>(field);
+}
+
+/**
+ * Transparently decrypt sensitive fields in a credential API response.
+ *
+ * Any property listed in `sensitiveFields` whose value looks like a
+ * ServerEncryptedField (has `keyId`, `iv` and `ciphertext`) is replaced with
+ * its decrypted value. Non-encrypted values are passed through unchanged, so
+ * this is safe to apply to mixed responses.
+ */
+export async function decryptCredentialResponse<T extends Record<string, unknown>>(
+  response: T,
+  sensitiveFields: string[]
+): Promise<T> {
+  const result: Record<string, unknown> = { ...response };
+
+  await Promise.all(
+    sensitiveFields.map(async (fieldName) => {
+      const value = result[fieldName];
+      if (
+        value &&
+        typeof value === 'object' &&
+        'keyId' in value &&
+        'iv' in value &&
+        'ciphertext' in value
+      ) {
+        result[fieldName] = await decryptServerField(value as ServerEncryptedField);
+      }
+    })
+  );
+
+  return result as T;
+}
+
 function bufferToBase64Url(buffer: ArrayBuffer | Uint8Array): string {
   const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
   let binary = '';
@@ -59,7 +210,7 @@ export async function importEncryptionKey(keyString: string): Promise<CryptoKey>
   const raw = base64UrlToBuffer(keyString);
   return window.crypto.subtle.importKey(
     'raw',
-    raw,
+    raw as unknown as BufferSource,
     { name: 'AES-GCM' },
     false,
     ['decrypt']
@@ -124,10 +275,10 @@ export async function decryptCredentialData<T = unknown>(
   const decrypted = await window.crypto.subtle.decrypt(
     {
       name: 'AES-GCM',
-      iv,
+      iv: iv as unknown as BufferSource,
     },
     key,
-    ciphertext
+    ciphertext as unknown as BufferSource
   );
 
   const decryptedString = new TextDecoder().decode(decrypted);
@@ -137,6 +288,105 @@ export async function decryptCredentialData<T = unknown>(
     data: parsed.data as T,
     expiresAt: payload.expiresAt,
     isExpired: isExpired || (now > parsed.expiresAt),
+  };
+}
+
+/**
+ * Options controlling how a time-limited share link is generated.
+ */
+export interface ShareLinkOptions {
+  /** Attributes (claim names) to disclose. If omitted, all claims are shared. */
+  disclosedAttributes?: string[];
+  /** Validity duration in milliseconds (default 24 hours). */
+  expiryDurationMs?: number;
+  /** Optional base URL for the generated link (defaults to current origin). */
+  baseUrl?: string;
+}
+
+/**
+ * Result of generating a time-limited share link.
+ */
+export interface ShareLink {
+  url: string;
+  expiresAt: number;
+  disclosedAttributes: string[];
+}
+
+/**
+ * Build a filtered share payload containing only the disclosed attributes.
+ *
+ * The credential is treated as a flat record of claims. Any claim not listed in
+ * `disclosedAttributes` is stripped so it never leaves the client. When
+ * `disclosedAttributes` is omitted, all claims are included.
+ */
+export function buildSharePayload(
+  credential: Record<string, unknown>,
+  disclosedAttributes?: string[],
+  expiresAt: number = Date.now() + 24 * 60 * 60 * 1000
+): { data: Record<string, unknown>; disclosedAttributes: string[]; expiresAt: number } {
+  const allAttributes = Object.keys(credential);
+  const attributes = disclosedAttributes
+    ? allAttributes.filter((attr) => disclosedAttributes.includes(attr))
+    : allAttributes;
+
+  const data: Record<string, unknown> = {};
+  for (const attr of attributes) {
+    data[attr] = credential[attr];
+  }
+
+  return { data, disclosedAttributes: attributes, expiresAt };
+}
+
+/**
+ * Generate a time-limited, selectively-disclosed share link.
+ *
+ * The filtered payload is encrypted with a fresh AES-GCM key. The key and the
+ * encrypted payload are packed into the URL fragment so they are never sent to
+ * the server in the request line. The recipient can decrypt the payload with
+ * `decryptCredentialData` using the key embedded in the fragment.
+ */
+export async function generateShareLink(
+  credential: Record<string, unknown>,
+  options: ShareLinkOptions = {}
+): Promise<ShareLink> {
+  const expiryDurationMs = options.expiryDurationMs ?? 24 * 60 * 60 * 1000;
+  const expiresAt = Date.now() + expiryDurationMs;
+
+  const { data, disclosedAttributes } = buildSharePayload(
+    credential,
+    options.disclosedAttributes,
+    expiresAt
+  );
+
+  const { key, keyString } = await generateEncryptionKey();
+  const payloadString = await encryptCredentialData(data, key, expiryDurationMs);
+
+  const baseUrl =
+    options.baseUrl ??
+    (typeof window !== 'undefined' && window.location
+      ? `${window.location.origin}/share`
+      : '/share');
+
+  const url = `${baseUrl}#payload=${payloadString}&key=${keyString}`;
+
+  return { url, expiresAt, disclosedAttributes };
+}
+
+/**
+ * Check whether a share link payload has expired without exposing its claims.
+ *
+ * Only the unencrypted envelope (which carries `expiresAt`) is parsed; the
+ * ciphertext is never decrypted, so no claim data is revealed.
+ */
+export function verifyShareLinkExpiry(payloadString: string): {
+  expiresAt: number;
+  isExpired: boolean;
+} {
+  const jsonStr = new TextDecoder().decode(base64UrlToBuffer(payloadString));
+  const payload: EncryptedPayload = JSON.parse(jsonStr);
+  return {
+    expiresAt: payload.expiresAt,
+    isExpired: Date.now() > payload.expiresAt,
   };
 }
 

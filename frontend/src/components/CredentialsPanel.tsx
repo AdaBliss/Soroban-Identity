@@ -1,15 +1,3 @@
-import { useState } from "react";
-import type { CredentialType, RevocationReason } from "../../../sdk/src/types";
-import { REVOCATION_REASONS } from "../../../sdk/src/types";
-import { exportCredentials, type ExportFormat } from "../export";
-import type { WalletState } from "../hooks/useWallet";
-
-interface Props {
-  wallet: WalletState & {
-    connect: () => void;
-    signTransaction: (xdr: string) => Promise<string>;
-  };
-}
 import { useState, useEffect, useReducer, useRef, lazy, Suspense } from "react";
 import { StrKey, SorobanRpc, TransactionBuilder, BASE_FEE, nativeToScVal, Contract, scValToNative } from '@stellar/stellar-sdk';
 import type { CredentialType, Credential, RevocationReason, VerifyResult } from "../../../sdk/src/types";
@@ -24,6 +12,7 @@ import { handleError } from "../utils/handleError";
 import { useWalletContext } from "../context/WalletContext";
 import { useToast } from "../context/ToastContext";
 import TemplateSelector from "../templates/TemplateSelector";
+import BrowserExtensionBanner from "./BrowserExtensionBanner";
 import { type CredentialTemplate, validateClaimsAgainstTemplate } from "../templates/credentialTemplates";
 import { exportCredentialsAsCSV, downloadExport } from "../utils/exportCredentials";
 import {
@@ -35,6 +24,8 @@ import {
   type ExportTemplate,
 } from "../export";
 import LoadingFallback from "./LoadingFallback";
+import AdvancedSearch, { type AdvancedSearchHandle } from "./AdvancedSearch";
+import type { SearchResult } from "../search/searchEngine";
 
 // ── Lazy-loaded components for code-splitting (#854) ─────────────────────────
 // These credential components are loaded on-demand to reduce initial bundle size
@@ -43,6 +34,7 @@ const CredentialImport = lazy(() => import("./CredentialImport"));
 const CredentialTimeline = lazy(() => import("./CredentialTimeline"));
 const CredentialShare = lazy(() => import("./CredentialShare"));
 const CredentialComparison = lazy(() => import("./CredentialComparison"));
+const PrivacySettings = lazy(() => import("./PrivacySettings"));
 const TemplateEditor = lazy(() => import("../export/TemplateEditor"));
 
 // Preload functions for hover/focus to improve perceived performance
@@ -50,6 +42,7 @@ const preloadCredentialImport = () => void import("./CredentialImport");
 const preloadCredentialTimeline = () => void import("./CredentialTimeline");
 const preloadCredentialShare = () => void import("./CredentialShare");
 const preloadCredentialComparison = () => void import("./CredentialComparison");
+const preloadPrivacySettings = () => void import("./PrivacySettings");
 const preloadTemplateEditor = () => void import("../export/TemplateEditor");
 
 type ExportFormat = "json" | "csv" | "xml" | "pdf";
@@ -68,23 +61,89 @@ type FilterType = "All" | CredentialType;
 type ExpiryFilterType = "All" | "Active" | "Expired";
 type CredentialStatus = "active" | "expired" | "revoked";
 
-function normalizeUnixTimestamp(expiresAt: number | bigint | string): number {
-  const num = typeof expiresAt === "bigint" ? Number(expiresAt) : Number(expiresAt);
-  if (!Number.isFinite(num)) return 0;
-  return num < 0 ? num >>> 0 : num;
+// ── #1101: Credential privacy controls ──────────────────────────────────────
+type CredentialVisibility = "public" | "private" | "custom";
+
+interface CredentialPrivacySettings {
+  visibility: CredentialVisibility;
+  /** Claim keys that are disclosed when visibility is "custom". */
+  disclosedAttributes: string[];
+  /** Trusted verifier addresses allowed to view the credential. */
+  whitelist: string[];
+  /** Optional expiry (unix seconds) for sharing links; 0 = no expiry. */
+  shareExpiry: number;
 }
 
-function formatExpiry(expiresAt: number): string {
-  const sec = normalizeUnixTimestamp(expiresAt);
-  if (sec === 0) return "No expiry";
+const PRIVACY_STORAGE_PREFIX = "credential-privacy:";
+
+const DEFAULT_PRIVACY_SETTINGS: CredentialPrivacySettings = {
+  visibility: "private",
+  disclosedAttributes: [],
+  whitelist: [],
+  shareExpiry: 0,
+};
+
+function loadPrivacySettings(credentialId: string): CredentialPrivacySettings {
+  try {
+    const raw = localStorage.getItem(`${PRIVACY_STORAGE_PREFIX}${credentialId}`);
+    if (!raw) return DEFAULT_PRIVACY_SETTINGS;
+    const parsed = JSON.parse(raw) as Partial<CredentialPrivacySettings>;
+    return {
+      visibility:
+        parsed.visibility === "public" || parsed.visibility === "custom" || parsed.visibility === "private"
+          ? parsed.visibility
+          : DEFAULT_PRIVACY_SETTINGS.visibility,
+      disclosedAttributes: Array.isArray(parsed.disclosedAttributes) ? parsed.disclosedAttributes : [],
+      whitelist: Array.isArray(parsed.whitelist) ? parsed.whitelist : [],
+      shareExpiry: typeof parsed.shareExpiry === "number" ? parsed.shareExpiry : 0,
+    };
+  } catch {
+    return DEFAULT_PRIVACY_SETTINGS;
+  }
+}
+
+function savePrivacySettings(credentialId: string, settings: CredentialPrivacySettings): void {
+  try {
+    localStorage.setItem(`${PRIVACY_STORAGE_PREFIX}${credentialId}`, JSON.stringify(settings));
+  } catch {
+    // Storage may be unavailable (private mode / quota) — privacy controls
+    // still work for the current session, so fail silently.
+  }
+}
+
+const VISIBILITY_BADGE: Record<CredentialVisibility, { label: string; icon: string; className: string }> = {
+  public: { label: "Public", icon: "🌐", className: "badge badge-green" },
+  private: { label: "Private", icon: "🔒", className: "badge badge-red" },
+  custom: { label: "Custom", icon: "🎛", className: "badge badge-yellow" },
+};
+
+const MAX_SAFE_TIMESTAMP_SECS = 8_640_000_000_000; // Max ECMAScript Date in seconds (~year 275760)
+const MAX_U64_TIMESTAMP = 18_446_744_073_709_551_615n;
+
+function normalizeExpiryTimestamp(expiresAt: number | bigint | string): number {
+  if (typeof expiresAt === "bigint") {
+    if (expiresAt <= 0n) return 0;
+    return expiresAt > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(expiresAt);
+  }
+  const num = typeof expiresAt === "string" ? Number(expiresAt) : expiresAt;
+  if (!Number.isFinite(num)) return 0;
+  // Recover from signed 32-bit integer overflow (e.g. dates past 2038/2106 coerced via bitwise ops)
+  if (num < 0) {
+    return num + 0x100000000;
+  }
+  return num;
+}
+
+function formatExpiry(expiresAt: number | bigint | string): string {
+  const normalized = normalizeExpiryTimestamp(expiresAt);
+  if (normalized === 0) return "No expiry";
 
   const nowSec = Math.floor(Date.now() / 1000);
-  const diffSec = sec - nowSec;
+  const diffSec = normalized - nowSec;
   const absSec = Math.abs(diffSec);
   const diffDays = Math.floor(absSec / (60 * 60 * 24));
   const diffHours = Math.floor(absSec / (60 * 60));
   const diffMinutes = Math.floor(absSec / 60);
-
   if (diffSec < 0) {
     if (diffDays > 0) return `Expired ${diffDays} day${diffDays > 1 ? "s" : ""} ago`;
     if (diffHours > 0) return `Expired ${diffHours} hour${diffHours > 1 ? "s" : ""} ago`;
@@ -96,8 +155,8 @@ function formatExpiry(expiresAt: number): string {
   return `Expires in ${diffMinutes} min${diffMinutes > 1 ? "s" : ""}`;
 }
 
-function getExpiryStyle(expiresAt: number): React.CSSProperties {
-  const sec = normalizeUnixTimestamp(expiresAt);
+function getExpiryStyle(expiresAt: number | bigint): React.CSSProperties {
+  const sec = normalizeExpiryTimestamp(expiresAt);
   if (sec === 0) return { color: "var(--text-muted)" };
 
   const nowSec = Math.floor(Date.now() / 1000);
@@ -113,9 +172,9 @@ function getExpiryStyle(expiresAt: number): React.CSSProperties {
   return { color: "var(--text-muted)" };
 }
 
-function isExpired(expiresAt: number): boolean {
-  const sec = normalizeUnixTimestamp(expiresAt);
-  return sec > 0 && Date.now() / 1000 > sec;
+function isExpired(expiresAt: number | bigint): boolean {
+  const normalized = normalizeExpiryTimestamp(expiresAt);
+  return normalized > 0 && Math.floor(Date.now() / 1000) > normalized;
 }
 
 function getCredentialStatus(credential: Credential): CredentialStatus {
@@ -275,8 +334,9 @@ function credentialReducer(_state: CredentialState, action: CredentialAction): C
   }
 }
 
-export default function CredentialsPanel({ verifyId }: { verifyId?: string | null }) {
-  const wallet = useWalletContext();
+export default function CredentialsPanel({ verifyId, wallet: propWallet }: { verifyId?: string | null; wallet?: any } = {}) {
+  const contextWallet = useWalletContext();
+  const wallet = propWallet ?? contextWallet;
   const toast = useToast();
   const [credentialState, dispatchCredential] = useReducer(credentialReducer, { status: 'idle' });
 
@@ -313,6 +373,17 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
   const [lastCheckedAt, setLastCheckedAt] = useState<number | null>(null);
   const [verifyCheckedAt, setVerifyCheckedAt] = useState<number | null>(null);
 
+  // ── Advanced search (#1104) ─────────────────────────────────────────────
+  // `searchResults` holds the ranked IDs produced by the advanced search
+  // engine (null = no active query). Filters are applied on top of this set.
+  const advancedSearchRef = useRef<AdvancedSearchHandle>(null);
+  const [searchResults, setSearchResults] = useState<SearchResult<Credential>[] | null>(null);
+  const searchResultIds = searchResults ? new Set(searchResults.map((r) => r.item.id)) : null;
+  const searchHighlights = new Map<string, string[]>(
+    (searchResults ?? []).map((r) => [r.item.id, r.highlights]),
+  );
+  const hasActiveSearch = searchResults !== null;
+
   // Import/Export state
   const [showImportModal, setShowImportModal] = useState(false);
   const [exportFormat, setExportFormat] = useState<ExportFormat>("json");
@@ -324,6 +395,76 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
   const [isExporting, setIsExporting] = useState(false);
   const [selectedCredentialsForExport, setSelectedCredentialsForExport] = useState<Set<string>>(new Set());
   const [sharingCredential, setSharingCredential] = useState<Credential | null>(null);
+
+  // ── #1101: Privacy controls ─────────────────────────────────────────────
+  // Privacy settings are persisted per credential in localStorage so they
+  // survive reloads and are available to the share flow.
+  const [privacySettings, setPrivacySettings] = useState<Record<string, CredentialPrivacySettings>>({});
+  const [privacyCredential, setPrivacyCredential] = useState<Credential | null>(null);
+
+  const getPrivacySettings = (credentialId: string): CredentialPrivacySettings =>
+    privacySettings[credentialId] ?? loadPrivacySettings(credentialId);
+
+  const handleSavePrivacySettings = (credentialId: string, settings: CredentialPrivacySettings) => {
+    savePrivacySettings(credentialId, settings);
+    setPrivacySettings((prev) => ({ ...prev, [credentialId]: settings }));
+    toast.success("Privacy settings saved.");
+  };
+
+  // ── Credential comparison (#1048) ───────────────────────────────────────
+  // Selection is separate from the export selection so the two features don't
+  // interfere with each other. 2-4 credentials can be compared at once.
+  const MIN_COMPARE = 2;
+  const MAX_COMPARE = 4;
+  const [selectedForComparison, setSelectedForComparison] = useState<Set<string>>(new Set());
+  const [showComparison, setShowComparison] = useState(false);
+  const [comparisonIds, setComparisonIds] = useState<string[]>([]);
+
+  const toggleComparisonSelection = (credentialId: string) => {
+    setSelectedForComparison((prev) => {
+      const next = new Set(prev);
+      if (next.has(credentialId)) {
+        next.delete(credentialId);
+      } else if (next.size < MAX_COMPARE) {
+        next.add(credentialId);
+      } else {
+        toast.error(`You can compare at most ${MAX_COMPARE} credentials at once.`);
+      }
+      return next;
+    });
+  };
+
+  const openComparison = (ids: string[]) => {
+    if (ids.length < MIN_COMPARE || ids.length > MAX_COMPARE) {
+      toast.error(`Select between ${MIN_COMPARE} and ${MAX_COMPARE} credentials to compare.`);
+      return;
+    }
+    setComparisonIds(ids);
+    setShowComparison(true);
+  };
+
+  // Shareable-link entry point: read `compare` credential IDs from the URL and
+  // open the comparison view automatically once the credentials are available.
+  const [pendingCompareIds] = useState<string[]>(() => {
+    const raw = new URLSearchParams(window.location.search).get("compare");
+    if (!raw) return [];
+    return raw
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .slice(0, MAX_COMPARE);
+  });
+
+  useEffect(() => {
+    if (pendingCompareIds.length < MIN_COMPARE) return;
+    if (displayCredentials.length === 0) return;
+    const available = pendingCompareIds.filter((id) => displayCredentials.some((c) => c.id === id));
+    if (available.length >= MIN_COMPARE) {
+      setSelectedForComparison(new Set(available));
+      setComparisonIds(available);
+      setShowComparison(true);
+    }
+  }, [pendingCompareIds, fetchedCredentials]);
 
   // ── Pagination ──────────────────────────────────────────────────────────
   const PAGE_SIZE_OPTIONS = [10, 25, 50, 100] as const;
@@ -479,7 +620,6 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
       const credentialClient = getCredentialClient();
       const caller = wallet.publicKey || "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN";
       const result = await credentialClient.verifyCredential(caller, id);
-      setVerifyState(result.valid ? "valid" : result.reason || "invalid");
       setVerifyCheckedAt(Date.now());
       const reason = result.reason;
       const knownReason: VerifyState =
@@ -621,14 +761,14 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
       errors.claims = "At least one claim key-value pair is required";
     }
 
-    // Validate expiry date
-    const trimmedExpiry = expiresAt.trim();
+    // Validate expiry date (supports 64-bit timestamps beyond year 2106 up to u64::MAX)
+    const trimmedExpiry = expiresAt.trim() || "0";
     if (!/^\d+$/.test(trimmedExpiry)) {
-      errors.expiresAt = "Expiry must be 0 or a positive number";
+      errors.expiresAt = "Expiry must be 0 or a positive integer timestamp";
     } else {
       const expiryBig = BigInt(trimmedExpiry);
-      if (expiryBig > 18446744073709551615n) {
-        errors.expiresAt = "Expiry exceeds maximum 64-bit unsigned integer";
+      if (expiryBig > MAX_U64_TIMESTAMP) {
+        errors.expiresAt = "Expiry exceeds maximum 64-bit timestamp value";
       } else if (expiryBig > 0n) {
         const now = BigInt(Math.floor(Date.now() / 1000));
         if (expiryBig <= now) {
@@ -743,12 +883,33 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
     setSelectedCredentialsForExport(newSet);
   };
 
+  const handleCopyComparisonLink = async () => {
+    const ids = Array.from(selectedForComparison);
+    if (ids.length < MIN_COMPARE) {
+      toast.error(`Select at least ${MIN_COMPARE} credentials to share a comparison link.`);
+      return;
+    }
+    const url = new URL(window.location.href);
+    url.searchParams.set("compare", ids.join(","));
+    try {
+      await navigator.clipboard.writeText(url.toString());
+      toast.success("Comparison link copied to clipboard.");
+    } catch {
+      toast.error("Could not copy the comparison link.");
+    }
+  };
+
   const displayCredentials = fetchedCredentials ?? [];
+
+  // Search narrows the set first; the type/expiry filters then refine it.
+  const searchedCredentials = searchResultIds
+    ? displayCredentials.filter((c) => searchResultIds.has(c.id))
+    : displayCredentials;
 
   const filteredCredentials =
     activeFilter === "All"
-      ? displayCredentials
-      : displayCredentials.filter((c) => c.credentialType === activeFilter);
+      ? searchedCredentials
+      : searchedCredentials.filter((c) => c.credentialType === activeFilter);
 
   const filteredByExpiry = filteredCredentials.filter((c) => {
     if (activeExpiryFilter === "All") return true;
@@ -786,9 +947,31 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
   const handleResetFilters = () => {
     setActiveFilter("All");
     setActiveExpiryFilter("All");
+    setSearchAddress("");
+    setSearchResults(null);
+    advancedSearchRef.current?.clear();
     setPage(1);
     updatePaginationParams(1, pageSize);
   };
+
+  // ── #1104: Advanced search wiring ───────────────────────────────────────
+  const handleAdvancedSearchResults = (results: SearchResult<Credential>[] | null) => {
+    setSearchResults(results);
+    setPage(1);
+    updatePaginationParams(1, pageSize);
+  };
+
+  // Ctrl/Cmd+K focuses the advanced search input.
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        advancedSearchRef.current?.focus();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
 
   // ── #738: RPC rate-limit-aware transaction helper ─────────────────────────
   // Wraps an async RPC call in an exponential-backoff retry loop so transient
@@ -909,8 +1092,9 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
 
   return (
     <>
+      <BrowserExtensionBanner credentials={displayCredentials} />
       {/* Filter bar */}
-      <div className="card">
+      <div className="card" data-tour="credential-list">
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "1rem" }}>
           <h2 style={{ margin: 0 }}>Credentials</h2>
           <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
@@ -1029,6 +1213,13 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
           </Suspense>
         )}
 
+        {/* Advanced search (#1104) */}
+        <AdvancedSearch
+          ref={advancedSearchRef}
+          items={displayCredentials}
+          onResultsChange={handleAdvancedSearchResults}
+        />
+
         {/* Subject search */}
         <div style={{ display: "flex", gap: "0.5rem", marginBottom: "1rem" }}>
           <label htmlFor="credential-search" className="visually-hidden">
@@ -1091,6 +1282,84 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
             Last checked: {formatCheckedAt(lastCheckedAt)} (auto-refreshes every 30s)
           </p>
         )}
+
+        {/* Comparison selection toolbar (#1048) */}
+        {displayCredentials.length >= MIN_COMPARE && (
+          <div
+            style={{
+              display: "flex",
+              flexWrap: "wrap",
+              alignItems: "center",
+              gap: "0.5rem",
+              marginBottom: "1rem",
+              padding: "0.5rem 0.75rem",
+              background: "var(--card-bg-accent)",
+              borderRadius: "0.5rem",
+              fontSize: "0.85rem",
+            }}
+          >
+            <span style={{ color: "var(--text-muted)" }}>
+              Compare ({selectedForComparison.size}/{MAX_COMPARE}):
+            </span>
+            <button
+              type="button"
+              onClick={() => openComparison(Array.from(selectedForComparison))}
+              disabled={selectedForComparison.size < MIN_COMPARE}
+              onMouseEnter={preloadCredentialComparison}
+              onFocus={preloadCredentialComparison}
+              style={{
+                padding: "0.35rem 0.85rem",
+                backgroundColor: "var(--accent-light)",
+                color: "white",
+                border: "none",
+                borderRadius: "0.25rem",
+                cursor: selectedForComparison.size < MIN_COMPARE ? "not-allowed" : "pointer",
+                fontSize: "0.85rem",
+                fontWeight: 500,
+                opacity: selectedForComparison.size < MIN_COMPARE ? 0.6 : 1,
+              }}
+              title={`Compare ${selectedForComparison.size} selected credential(s)`}
+            >
+              ⚖ Compare
+            </button>
+            <button
+              type="button"
+              onClick={() => void handleCopyComparisonLink()}
+              disabled={selectedForComparison.size < MIN_COMPARE}
+              style={{
+                padding: "0.35rem 0.85rem",
+                backgroundColor: "transparent",
+                color: "var(--accent-light)",
+                border: "1px solid var(--accent-light)",
+                borderRadius: "0.25rem",
+                cursor: selectedForComparison.size < MIN_COMPARE ? "not-allowed" : "pointer",
+                fontSize: "0.85rem",
+                fontWeight: 500,
+                opacity: selectedForComparison.size < MIN_COMPARE ? 0.6 : 1,
+              }}
+              title="Copy a shareable comparison link"
+            >
+              🔗 Copy link
+            </button>
+            {selectedForComparison.size > 0 && (
+              <button
+                type="button"
+                onClick={() => setSelectedForComparison(new Set())}
+                style={{
+                  padding: "0.35rem 0.85rem",
+                  backgroundColor: "transparent",
+                  color: "var(--text-muted)",
+                  border: "1px solid var(--border-input)",
+                  borderRadius: "0.25rem",
+                  cursor: "pointer",
+                  fontSize: "0.85rem",
+                }}
+              >
+                Clear
+              </button>
+            )}
+          </div>
+        )}
         <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap", marginBottom: "1rem" }}>
           {EXPIRY_FILTER_OPTIONS.map((status) => {
             const count = countByExpiry(displayCredentials, status);
@@ -1128,14 +1397,14 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
               </button>
             );
           })}
-          {(activeFilter !== "All" || activeExpiryFilter !== "All") && (
+          {(activeFilter !== "All" || activeExpiryFilter !== "All" || searchAddress.trim() !== "" || hasActiveSearch) && (
             <button
               type="button"
               onClick={handleResetFilters}
               style={{
                 padding: "0.3rem 0.75rem",
                 borderRadius: "999px",
-                border: "1px solid var(--border-input)",
+                border: "2px solid var(--border-input)",
                 background: "transparent",
                 color: "var(--text-muted)",
                 cursor: "pointer",
@@ -1155,7 +1424,9 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
           <CredentialEmptyState searchedAddress={searchedAddress} />
         ) : sortedCredentials.length === 0 ? (
           <p style={{ color: "var(--text-muted)", fontSize: "0.85rem" }}>
-            No credentials match the selected filters.
+            {hasActiveSearch
+              ? "No credentials match your search and filters."
+              : "No credentials match the selected filters."}
           </p>
         ) : (
           <>
@@ -1200,7 +1471,18 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
                       toggleCredentialSelection(cred.id);
                     }}
                     style={{ cursor: "pointer" }}
-                    aria-label={`Select credential ${cred.id}`}
+                    aria-label={`Select credential ${cred.id} for export`}
+                  />
+                  <input
+                    type="checkbox"
+                    checked={selectedForComparison.has(cred.id)}
+                    onChange={(e) => {
+                      e.stopPropagation();
+                      toggleComparisonSelection(cred.id);
+                    }}
+                    style={{ cursor: "pointer" }}
+                    aria-label={`Select credential ${cred.id} for comparison`}
+                    title="Select for comparison"
                   />
                   <span style={{ fontSize: "1.2rem", minWidth: "1.5rem" }}>
                     {CREDENTIAL_TYPE_ICONS[cred.credentialType] || "📋"}
@@ -1217,6 +1499,40 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
                     {getStatusLabel(status)}
                   </span>
                   <span style={getExpiryStyle(cred.expiresAt)}>{formatExpiry(cred.expiresAt)}</span>
+                  {(() => {
+                    const visibility = getPrivacySettings(cred.id).visibility;
+                    const badge = VISIBILITY_BADGE[visibility];
+                    return (
+                      <span
+                        className={badge.className}
+                        title={`Visibility: ${badge.label}`}
+                        aria-label={`Credential visibility: ${badge.label}`}
+                      >
+                        {badge.icon} {badge.label}
+                      </span>
+                    );
+                  })()}
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setPrivacyCredential(cred);
+                    }}
+                    onMouseEnter={preloadPrivacySettings}
+                    onFocus={preloadPrivacySettings}
+                    style={{
+                      background: "none",
+                      border: "none",
+                      cursor: "pointer",
+                      fontSize: "1rem",
+                      color: "var(--accent-light)",
+                      marginLeft: "auto",
+                      marginRight: "0.5rem",
+                    }}
+                    title="Configure privacy and sharing controls"
+                    aria-label={`Privacy settings for credential ${cred.id}`}
+                  >
+                    🛡
+                  </button>
                   <button
                     onClick={(e) => {
                       e.stopPropagation();
@@ -1228,7 +1544,6 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
                       cursor: "pointer",
                       fontSize: "1rem",
                       color: "var(--accent-light)",
-                      marginLeft: "auto",
                       marginRight: "0.5rem",
                     }}
                     title="Share credential via encrypted link"
@@ -1241,7 +1556,10 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
                   </span>
                 </button>
                 {expandedCredId === cred.id && (
-                  <div style={{ padding: "0.75rem 1rem", borderTop: "1px solid var(--border-input)", background: "var(--card-bg-accent)" }}>
+                  <div
+                    data-tour="credential-details"
+                    style={{ padding: "0.75rem 1rem", borderTop: "1px solid var(--border-input)", background: "var(--card-bg-accent)" }}
+                  >
                     <dl style={{ margin: "0 0 0.75rem", fontSize: "0.8rem" }}>
                       <div style={{ display: "flex", gap: "1rem", marginBottom: "0.25rem" }}>
                         <dt style={{ fontWeight: 600, color: "var(--text-muted)", minWidth: "120px" }}>Issued</dt>
@@ -1268,6 +1586,28 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
                     ) : (
                       <p style={{ margin: 0, color: "var(--text-muted)", fontSize: "0.8rem" }}>No claims</p>
                     )}
+                    {searchHighlights.get(cred.id)?.length ? (
+                      <p
+                        style={{ margin: "0.5rem 0 0", fontSize: "0.75rem", color: "var(--text-muted)" }}
+                        aria-label="Search match highlights"
+                      >
+                        Matches:{" "}
+                        {searchHighlights.get(cred.id)!.map((h, i) => (
+                          <mark
+                            key={`${h}-${i}`}
+                            style={{
+                              background: "var(--card-bg-accent)",
+                              color: "var(--accent-light)",
+                              borderRadius: "0.2rem",
+                              padding: "0 0.2rem",
+                              marginRight: "0.25rem",
+                            }}
+                          >
+                            {h}
+                          </mark>
+                        ))}
+                      </p>
+                    ) : null}
                     {/* Credential lifecycle timeline — closes #707 */}
                     <CredentialTimeline credential={cred} />
                   </div>
@@ -1422,13 +1762,14 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
         )}
       </div>
 
-      <div className="card">
+      <div className="card" data-tour="verify-credential">
         <h2>Verify Credential</h2>
         <label htmlFor="verify-credential-id" className="visually-hidden">
           Credential ID to verify
         </label>
         <input
           id="verify-credential-id"
+          data-tour="verify-credential-input"
           placeholder="Credential ID (hex)"
           value={credId}
           onChange={(e) => setCredId(e.target.value)}
@@ -1466,7 +1807,7 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
         )}
       </div>
 
-      <div className="card">
+      <div className="card" data-tour="issue-credential">
         <h2>Issue Credential</h2>
         {wallet.connected ? (
           isIssuer ? (
@@ -1483,7 +1824,8 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
                 selectedTemplateId={selectedTemplate?.id}
                 onSelectTemplate={handleSelectTemplate}
               />
-              
+
+              <div data-tour="credential-form">
               <FormField
                 label="Subject Address"
                 placeholder="Subject address (G…)"
@@ -1561,8 +1903,13 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
                 error={issueErrors.expiresAt}
                 style={{ marginBottom: "1rem" }}
               />
+              </div>
 
-              <button onClick={handleIssue} disabled={issuing || Object.keys(issueErrors).length > 0}>
+              <button
+                data-tour="issue-credential-button"
+                onClick={handleIssue}
+                disabled={issuing || Object.keys(issueErrors).length > 0}
+              >
                 {issuing
                   ? "Issuing…"
                   : selectedTemplate
@@ -1577,7 +1924,7 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
             </p>
           )
         ) : (
-          <p style={{ color: "var(--text-muted)", fontSize: "0.85rem" }}>
+          <p data-tour="credential-wallet" style={{ color: "var(--text-muted)", fontSize: "0.85rem" }}>
             Connect your Freighter wallet to issue credentials as a registered issuer.
           </p>
         )}
@@ -1624,12 +1971,35 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
         </Suspense>
       )}
 
+      {/* Privacy Settings Modal (#1101) */}
+      {privacyCredential && (
+        <Suspense fallback={<LoadingFallback />}>
+          <PrivacySettings
+            credential={privacyCredential}
+            settings={getPrivacySettings(privacyCredential.id)}
+            onSave={(settings) => handleSavePrivacySettings(privacyCredential.id, settings)}
+            onClose={() => setPrivacyCredential(null)}
+          />
+        </Suspense>
+      )}
+
       {/* Share Modal */}
       {sharingCredential && (
         <Suspense fallback={<LoadingFallback />}>
           <CredentialShare
             credential={sharingCredential}
+            privacySettings={getPrivacySettings(sharingCredential.id)}
             onClose={() => setSharingCredential(null)}
+          />
+        </Suspense>
+      )}
+
+      {/* Comparison Modal (#1048) */}
+      {showComparison && comparisonIds.length >= MIN_COMPARE && (
+        <Suspense fallback={<LoadingFallback />}>
+          <CredentialComparison
+            credentials={displayCredentials.filter((c) => comparisonIds.includes(c.id))}
+            onClose={() => setShowComparison(false)}
           />
         </Suspense>
       )}

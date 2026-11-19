@@ -29,6 +29,8 @@ export interface UsePresenceOptions {
   staleAfterMs?: number;
   /** Milliseconds between reconnect attempts. */
   reconnectDelayMs?: number;
+  /** Maximum reconnect attempts before stopping automatic retries (#1068). */
+  maxReconnectAttempts?: number;
 }
 
 export interface UsePresenceResult {
@@ -45,13 +47,15 @@ export interface UsePresenceResult {
 }
 
 const DEFAULT_STALE_MS = 30_000;
-const DEFAULT_RECONNECT_MS = 1_000;
-const MAX_RECONNECT_MS = 30_000;
+const DEFAULT_RECONNECT_MS = 3_000;
+const MAX_RECONNECT_DELAY_MS = 30_000;
+const DEFAULT_MAX_RECONNECT_ATTEMPTS = 10;
 
 /**
  * Tracks active collaborators on a DID/credential over a WebSocket presence
  * protocol. Handles joins, updates, leaves, periodic syncs, stale peers and
- * graceful reconnection when the connection drops.
+ * graceful reconnection when the connection drops or the device switches
+ * networks (#1068).
  */
 export function usePresence({
   url,
@@ -59,6 +63,7 @@ export function usePresence({
   currentUser,
   staleAfterMs = DEFAULT_STALE_MS,
   reconnectDelayMs = DEFAULT_RECONNECT_MS,
+  maxReconnectAttempts = DEFAULT_MAX_RECONNECT_ATTEMPTS,
 }: UsePresenceOptions): UsePresenceResult {
   const [users, setUsers] = useState<PresenceUser[]>([]);
   const [status, setStatusState] = useState<PresenceStatus>('viewing');
@@ -67,6 +72,7 @@ export function usePresence({
   const socketRef = useRef<WebSocket | null>(null);
   const reconnectRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectAttemptsRef = useRef(0);
+  const offlineRef = useRef(false);
   const closedRef = useRef(false);
   const statusRef = useRef<PresenceStatus>('viewing');
   const currentUserRef = useRef(currentUser);
@@ -112,21 +118,14 @@ export function usePresence({
     closedRef.current = false;
     reconnectAttemptsRef.current = 0;
 
-    const scheduleReconnect = () => {
-      if (closedRef.current || reconnectRef.current) return;
-      if (typeof navigator !== 'undefined' && navigator.onLine === false) {
-        return;
-      }
-      const attempt = reconnectAttemptsRef.current++;
-      const baseDelay = Math.min(reconnectDelayMs * Math.pow(2, attempt), MAX_RECONNECT_MS);
-      const jitter = Math.floor(Math.random() * Math.min(500, baseDelay * 0.2));
-      reconnectRef.current = setTimeout(() => {
+    const clearReconnectTimer = () => {
+      if (reconnectRef.current !== null) {
+        clearTimeout(reconnectRef.current);
         reconnectRef.current = null;
-        connect();
-      }, baseDelay + jitter);
+      }
     };
 
-    const teardownCurrentSocket = () => {
+    const teardownSocket = () => {
       const existing = socketRef.current;
       socketRef.current = null;
       if (existing) {
@@ -137,19 +136,42 @@ export function usePresence({
         try {
           existing.close();
         } catch {
-          // Ignore close errors
+          // Ignore close errors on an already-closed socket.
         }
       }
     };
 
+    const scheduleReconnect = () => {
+      if (
+        closedRef.current ||
+        offlineRef.current ||
+        reconnectRef.current !== null ||
+        reconnectAttemptsRef.current >= maxReconnectAttempts
+      ) {
+        return;
+      }
+      if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+        return;
+      }
+      reconnectAttemptsRef.current += 1;
+      const baseDelay = Math.min(
+        MAX_RECONNECT_DELAY_MS,
+        reconnectDelayMs * 2 ** (reconnectAttemptsRef.current - 1),
+      );
+      const jitter = Math.floor(Math.random() * Math.min(500, baseDelay * 0.2));
+      reconnectRef.current = setTimeout(() => {
+        reconnectRef.current = null;
+        connect();
+      }, baseDelay + jitter);
+    };
+
     const connect = () => {
-      if (closedRef.current) return;
+      if (closedRef.current || offlineRef.current || socketRef.current) return;
       if (typeof navigator !== 'undefined' && navigator.onLine === false) {
         setConnected(false);
         return;
       }
-
-      teardownCurrentSocket();
+      clearReconnectTimer();
 
       let socket: WebSocket;
       try {
@@ -182,16 +204,16 @@ export function usePresence({
           return;
         }
 
-        const myId = currentUserRef.current.id;
+        const localUserId = currentUserRef.current.id;
         switch (message.type) {
           case 'presence:sync':
             if (message.users) {
-              setUsers(message.users.filter((u) => u.id !== myId));
+              setUsers(message.users.filter((u) => u.id !== localUserId));
             }
             break;
           case 'presence:join':
           case 'presence:update':
-            if (message.user && message.user.id !== myId) {
+            if (message.user && message.user.id !== localUserId) {
               upsertUser(message.user);
             }
             break;
@@ -204,42 +226,39 @@ export function usePresence({
       };
 
       socket.onclose = () => {
-        setConnected(false);
         socketRef.current = null;
+        setConnected(false);
         if (!closedRef.current) {
           scheduleReconnect();
         }
       };
 
       socket.onerror = () => {
-        try {
-          socket.close();
-        } catch {
-          // Ignore close errors
-        }
+        teardownSocket();
+        setConnected(false);
+        scheduleReconnect();
       };
     };
 
     const handleOnline = () => {
       if (closedRef.current) return;
-      if (reconnectRef.current) {
-        clearTimeout(reconnectRef.current);
-        reconnectRef.current = null;
-      }
+      offlineRef.current = false;
       reconnectAttemptsRef.current = 0;
+      clearReconnectTimer();
+      teardownSocket();
+      setConnected(false);
       connect();
     };
 
     const handleOffline = () => {
-      if (reconnectRef.current) {
-        clearTimeout(reconnectRef.current);
-        reconnectRef.current = null;
-      }
+      if (closedRef.current) return;
+      offlineRef.current = true;
+      clearReconnectTimer();
+      teardownSocket();
       setConnected(false);
-      teardownCurrentSocket();
     };
 
-    if (typeof window !== 'undefined') {
+    if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
       window.addEventListener('online', handleOnline);
       window.addEventListener('offline', handleOffline);
     }
@@ -248,13 +267,10 @@ export function usePresence({
 
     return () => {
       closedRef.current = true;
-      if (typeof window !== 'undefined') {
+      clearReconnectTimer();
+      if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
         window.removeEventListener('online', handleOnline);
         window.removeEventListener('offline', handleOffline);
-      }
-      if (reconnectRef.current) {
-        clearTimeout(reconnectRef.current);
-        reconnectRef.current = null;
       }
       const socket = socketRef.current;
       if (socket && socket.readyState === WebSocket.OPEN) {
@@ -266,9 +282,9 @@ export function usePresence({
           // Ignore send errors on teardown
         }
       }
-      teardownCurrentSocket();
+      teardownSocket();
     };
-  }, [url, resourceId, currentUser.id, reconnectDelayMs, send, upsertUser, removeUser]);
+  }, [url, resourceId, reconnectDelayMs, maxReconnectAttempts, send, upsertUser, removeUser]);
 
   // Drop peers that stopped sending heartbeats.
   useEffect(() => {

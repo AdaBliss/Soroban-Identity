@@ -1,14 +1,139 @@
-import React, { useState, useEffect, useMemo } from "react";
+import React, { useState, useEffect, useMemo, useCallback } from "react";
 import type { Credential } from "../../../sdk/src/types";
 import { ReputationClient } from "../../../sdk/src/reputation";
 import { getNetworkConfig } from "../network";
 import { formatTimestamp } from "../utils/formatDate";
+import { exportToPdf, exportToPng } from "../export/pdf";
+import { copyComparisonLink } from "../export/comparison";
+
+export interface CredentialVersionSnapshot {
+  /** Unique identifier for this version (e.g. version number or hash). */
+  versionId: string;
+  /** The credential state captured at this version. */
+  credential: Credential;
+  /** Optional human-readable label / annotation for the version. */
+  label?: string;
+  /** Optional free-form notes attached to the version. */
+  notes?: string;
+  /** Timestamp (seconds) when this version was created. */
+  createdAt?: number;
+  /** Optional parent version id, used to render branching. */
+  parentVersionId?: string;
+}
 
 export interface CredentialComparisonProps {
   credentials: Credential[];
   onRemoveCredential?: (id: string) => void;
   onAddCredential?: (credential: Credential) => void;
+  onClose?: () => void;
+  /** Optional two version snapshots of the same credential to diff. */
+  versions?: [CredentialVersionSnapshot, CredentialVersionSnapshot];
+  /** Called when the user requests to restore a given version. */
+  onRestoreVersion?: (version: CredentialVersionSnapshot) => void;
+  /** Called when the user requests to branch from a given version. */
+  onBranchVersion?: (version: CredentialVersionSnapshot) => void;
 }
+
+export type FieldChangeKind = "added" | "removed" | "modified" | "unchanged";
+
+export interface FieldChange {
+  key: string;
+  before: string | undefined;
+  after: string | undefined;
+  kind: FieldChangeKind;
+}
+
+/**
+ * Computes a field-level diff between two credential versions.
+ * Treats missing values as undefined and classifies each field.
+ */
+export function computeVersionDiff(
+  before: Credential,
+  after: Credential
+): FieldChange[] {
+  const changes: FieldChange[] = [];
+
+  const classify = (
+    key: string,
+    beforeVal: string | undefined,
+    afterVal: string | undefined
+  ) => {
+    let kind: FieldChangeKind = "unchanged";
+    if (beforeVal === afterVal) {
+      kind = "unchanged";
+    } else if (beforeVal === undefined || beforeVal === "") {
+      kind = "added";
+    } else if (afterVal === undefined || afterVal === "") {
+      kind = "removed";
+    } else {
+      kind = "modified";
+    }
+    changes.push({ key, before: beforeVal, after: afterVal, kind });
+  };
+
+  classify("credentialType", before.credentialType, after.credentialType);
+  classify("issuer", before.issuer, after.issuer);
+  classify(
+    "expiresAt",
+    before.expiresAt ? String(before.expiresAt) : undefined,
+    after.expiresAt ? String(after.expiresAt) : undefined
+  );
+  classify(
+    "revoked",
+    before.revoked ? "true" : "false",
+    after.revoked ? "true" : "false"
+  );
+
+  const claimKeys = new Set<string>([
+    ...Object.keys(before.claims || {}),
+    ...Object.keys(after.claims || {}),
+  ]);
+  Array.from(claimKeys)
+    .sort()
+    .forEach((key) => {
+      classify(`claim:${key}`, before.claims?.[key], after.claims?.[key]);
+    });
+
+  return changes;
+}
+
+const changeBadgeStyle = (kind: FieldChangeKind): React.CSSProperties => {
+  switch (kind) {
+    case "added":
+      return {
+        background: "var(--badge-green-bg, #dcfce7)",
+        color: "var(--badge-green-text, #166534)",
+      };
+    case "removed":
+      return {
+        background: "var(--badge-red-bg, #fee2e2)",
+        color: "var(--badge-red-text, #991b1b)",
+      };
+    case "modified":
+      return {
+        background: "var(--badge-yellow-bg, #fef9c3)",
+        color: "var(--badge-yellow-text, #854d0e)",
+      };
+    default:
+      return {
+        background: "var(--bg-subtle, #f1f5f9)",
+        color: "var(--text-muted, #64748b)",
+      };
+  }
+};
+
+const changeRowBackground = (kind: FieldChangeKind): string => {
+  switch (kind) {
+    case "added":
+      return "rgba(34, 197, 94, 0.12)";
+    case "removed":
+      return "rgba(239, 68, 68, 0.12)";
+    case "modified":
+      return "rgba(234, 179, 8, 0.12)";
+    default:
+      return "transparent";
+  }
+};
 
 export interface ClaimDiff {
   key: string;
@@ -66,15 +191,55 @@ export function getCredentialVerificationStatus(credential: Credential): Verific
   return { status: "active", isValid: true, label: "Valid / Active" };
 }
 
+export const MIN_COMPARE = 2;
+export const MAX_COMPARE = 4;
+
+/**
+ * Builds a shareable comparison URL encoding the selected credential IDs.
+ */
+export function buildComparisonLink(credentialIds: string[]): string {
+  const ids = credentialIds.slice(0, MAX_COMPARE).join(",");
+  const base =
+    typeof window !== "undefined" && window.location
+      ? `${window.location.origin}${window.location.pathname}`
+      : "";
+  return `${base}?compare=${encodeURIComponent(ids)}`;
+}
+
 export const CredentialComparison: React.FC<CredentialComparisonProps> = ({
   credentials,
   onRemoveCredential,
+  versions,
+  onRestoreVersion,
+  onBranchVersion,
 }) => {
+  const isVersionMode = !!versions && versions.length === 2;
+  const [showOnlyChanges, setShowOnlyChanges] = useState<boolean>(false);
+
+  const versionDiff = useMemo(() => {
+    if (!isVersionMode || !versions) return [];
+    return computeVersionDiff(versions[0].credential, versions[1].credential);
+  }, [isVersionMode, versions]);
+
+  const filteredVersionDiff = useMemo(() => {
+    if (!showOnlyChanges) return versionDiff;
+    return versionDiff.filter((c) => c.kind !== "unchanged");
+  }, [versionDiff, showOnlyChanges]);
+
+  const changedCount = useMemo(
+    () => versionDiff.filter((c) => c.kind !== "unchanged").length,
+    [versionDiff]
+  );
   // Support 2 to 4 credentials
-  const visibleCredentials = useMemo(() => credentials.slice(0, 4), [credentials]);
+  const visibleCredentials = useMemo(
+    () => credentials.slice(0, MAX_COMPARE),
+    [credentials]
+  );
   const [showOnlyDifferences, setShowOnlyDifferences] = useState<boolean>(false);
   const [reputationScores, setReputationScores] = useState<Record<string, number | null>>({});
   const [isLoadingReputation, setIsLoadingReputation] = useState<boolean>(false);
+  const [toast, setToast] = useState<string | null>(null);
+  const [isExporting, setIsExporting] = useState<boolean>(false);
 
   // Load issuer reputation scores
   useEffect(() => {
@@ -147,103 +312,382 @@ export const CredentialComparison: React.FC<CredentialComparisonProps> = ({
     return expiries.size > 1;
   }, [visibleCredentials]);
 
-  // Export comparison as PDF report
-  const handleExportPDF = () => {
-    const reportHtml = `
-      <!DOCTYPE html>
-      <html>
-        <head>
-          <title>Credential Comparison Report</title>
-          <style>
-            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; padding: 24px; color: #1e293b; }
-            h1 { font-size: 20px; margin-bottom: 8px; }
-            p { font-size: 13px; color: #64748b; margin-bottom: 20px; }
-            table { width: 100%; border-collapse: collapse; margin-top: 16px; font-size: 13px; }
-            th, td { border: 1px solid #cbd5e1; padding: 8px 12px; text-align: left; }
-            th { background: #f8fafc; font-weight: 600; }
-            .diff { background: #fef3c7; }
-            .badge { display: inline-block; padding: 2px 6px; border-radius: 4px; font-weight: bold; font-size: 11px; }
-            .valid { background: #dcfce7; color: #166534; }
-            .expired { background: #fef9c3; color: #854d0e; }
-            .revoked { background: #fee2e2; color: #991b1b; }
-          </style>
-        </head>
-        <body>
-          <h1>Credential Comparison Report</h1>
-          <p>Generated on ${new Date().toLocaleString()} • Comparing ${visibleCredentials.length} credentials</p>
-          <table>
+  // Build a structured report model shared by PDF and PNG exports.
+  const buildReport = useCallback(() => {
+    const rows: Array<{ label: string; values: string[]; isDiff: boolean }> = [];
+
+    rows.push({
+      label: "Verification Status",
+      values: visibleCredentials.map((c) => getCredentialVerificationStatus(c).label),
+      isDiff: new Set(visibleCredentials.map((c) => getCredentialVerificationStatus(c).status)).size > 1,
+    });
+    rows.push({
+      label: "Credential Type",
+      values: visibleCredentials.map((c) => c.credentialType),
+      isDiff: isTypeDiff,
+    });
+    rows.push({
+      label: "Issuer",
+      values: visibleCredentials.map((c) => c.issuer),
+      isDiff: isIssuerDiff,
+    });
+    rows.push({
+      label: "Issuer Reputation",
+      values: visibleCredentials.map((c) => {
+        const score = reputationScores[c.issuer];
+        return score !== undefined && score !== null ? `${score}/100` : "N/A";
+      }),
+      isDiff: new Set(visibleCredentials.map((c) => reputationScores[c.issuer] ?? null)).size > 1,
+    });
+    rows.push({
+      label: "Expires At",
+      values: visibleCredentials.map((c) =>
+        c.expiresAt === 0 ? "No Expiry" : formatTimestamp(c.expiresAt)
+      ),
+      isDiff: isExpiryDiff,
+    });
+
+    claimDiffs.forEach((d) => {
+      rows.push({
+        label: `Claim: ${d.key}`,
+        values: visibleCredentials.map((c) => c.claims?.[d.key] ?? "(not present)"),
+        isDiff: d.hasDifference,
+      });
+    });
+
+    return {
+      title: "Credential Comparison Report",
+      subtitle: `Generated on ${new Date().toLocaleString()} • Comparing ${visibleCredentials.length} credentials`,
+      columns: visibleCredentials.map((c, i) => `Credential #${i + 1} (${c.id.slice(0, 8)}...)`),
+      rows,
+      credentials: visibleCredentials,
+      issuerReputations: visibleCredentials.map((c) => reputationScores[c.issuer]),
+    };
+  }, [
+    visibleCredentials,
+    reputationScores,
+    claimDiffs,
+    isTypeDiff,
+    isIssuerDiff,
+    isExpiryDiff,
+  ]);
+
+  // Export comparison as PDF report using jsPDF helpers
+  const handleExportPDF = useCallback(async () => {
+    if (visibleCredentials.length < MIN_COMPARE) return;
+    setIsExporting(true);
+    try {
+      const report = buildReport();
+      await exportToPdf(report, `credential-comparison-${Date.now()}.pdf`);
+      setToast("Comparison exported as PDF");
+    } catch {
+      setToast("Failed to export PDF");
+    } finally {
+      setIsExporting(false);
+    }
+  }, [buildReport, visibleCredentials.length]);
+
+  // Export comparison as PNG image
+  const handleExportImage = useCallback(async () => {
+    if (visibleCredentials.length < MIN_COMPARE) return;
+    setIsExporting(true);
+    try {
+      const report = buildReport();
+      await exportToPng(report, `credential-comparison-${Date.now()}.png`);
+      setToast("Comparison exported as image");
+    } catch {
+      setToast("Failed to export image");
+    } finally {
+      setIsExporting(false);
+    }
+  }, [buildReport, visibleCredentials.length]);
+
+  // Copy a shareable comparison link to the clipboard
+  const handleCopyLink = useCallback(async () => {
+    const link = buildComparisonLink(visibleCredentials.map((c) => c.id));
+    try {
+      await copyComparisonLink(link);
+      setToast("Comparison link copied to clipboard");
+    } catch {
+      setToast("Failed to copy comparison link");
+    }
+  }, [visibleCredentials]);
+
+  // Auto-dismiss toast notifications
+  useEffect(() => {
+    if (!toast) return;
+    const timer = setTimeout(() => setToast(null), 2500);
+    return () => clearTimeout(timer);
+  }, [toast]);
+
+  if (isVersionMode && versions) {
+    const [beforeVersion, afterVersion] = versions;
+    return (
+      <div
+        className="credential-version-comparison-container"
+        style={{
+          background: "var(--card-bg, #ffffff)",
+          border: "1px solid var(--card-border, #e2e8f0)",
+          borderRadius: "12px",
+          padding: "1.5rem",
+          marginBottom: "1.5rem",
+          boxShadow: "0 4px 6px -1px rgba(0, 0, 0, 0.05)",
+        }}
+      >
+        {/* Header & Controls */}
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            flexWrap: "wrap",
+            gap: "1rem",
+            marginBottom: "1.5rem",
+            borderBottom: "1px solid var(--card-border, #e2e8f0)",
+            paddingBottom: "1rem",
+          }}
+        >
+          <div>
+            <h2 style={{ fontSize: "1.25rem", fontWeight: 700, margin: 0, color: "var(--text)" }}>
+              Credential Version Comparison
+            </h2>
+            <span style={{ fontSize: "0.85rem", color: "var(--text-muted)" }}>
+              {changedCount} changed field{changedCount === 1 ? "" : "s"} between versions
+            </span>
+          </div>
+
+          <div style={{ display: "flex", gap: "1rem", alignItems: "center", flexWrap: "wrap" }}>
+            <label
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: "0.4rem",
+                fontSize: "0.85rem",
+                cursor: "pointer",
+                userSelect: "none",
+              }}
+            >
+              <input
+                type="checkbox"
+                checked={showOnlyChanges}
+                onChange={(e) => setShowOnlyChanges(e.target.checked)}
+              />
+              <span style={{ fontWeight: 600 }}>Show Only Changes</span>
+            </label>
+
+            {onRestoreVersion && (
+              <button
+                type="button"
+                onClick={() => onRestoreVersion(beforeVersion)}
+                style={{
+                  background: "transparent",
+                  color: "var(--accent, #7c3aed)",
+                  border: "1px solid var(--accent, #7c3aed)",
+                  borderRadius: "6px",
+                  padding: "0.45rem 1rem",
+                  fontSize: "0.85rem",
+                  fontWeight: 600,
+                  cursor: "pointer",
+                }}
+              >
+                Restore {beforeVersion.label ?? beforeVersion.versionId}
+              </button>
+            )}
+
+            {onBranchVersion && (
+              <button
+                type="button"
+                onClick={() => onBranchVersion(afterVersion)}
+                style={{
+                  background: "var(--accent, #7c3aed)",
+                  color: "#ffffff",
+                  border: "none",
+                  borderRadius: "6px",
+                  padding: "0.45rem 1rem",
+                  fontSize: "0.85rem",
+                  fontWeight: 600,
+                  cursor: "pointer",
+                }}
+              >
+                Branch from {afterVersion.label ?? afterVersion.versionId}
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Version metadata */}
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "1fr 1fr",
+            gap: "1rem",
+            marginBottom: "1.5rem",
+          }}
+        >
+          {[beforeVersion, afterVersion].map((v, idx) => (
+            <div
+              key={v.versionId}
+              style={{
+                padding: "0.75rem 1rem",
+                borderRadius: "8px",
+                border: "1px solid var(--card-border, #e2e8f0)",
+                background: "var(--bg-subtle, #f1f5f9)",
+              }}
+            >
+              <div style={{ fontWeight: 700, fontSize: "0.9rem" }}>
+                {idx === 0 ? "Before" : "After"}: {v.label ?? v.versionId}
+              </div>
+              {v.createdAt !== undefined && (
+                <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>
+                  {formatTimestamp(v.createdAt)}
+                </div>
+              )}
+              {v.parentVersionId && (
+                <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>
+                  Branched from: {v.parentVersionId}
+                </div>
+              )}
+              {v.notes && (
+                <div style={{ fontSize: "0.8rem", marginTop: "0.35rem", fontStyle: "italic" }}>
+                  {v.notes}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+
+        {/* Diff table */}
+        <div style={{ overflowX: "auto" }}>
+          <table
+            style={{
+              width: "100%",
+              borderCollapse: "collapse",
+              fontSize: "0.85rem",
+              tableLayout: "fixed",
+            }}
+          >
             <thead>
-              <tr>
-                <th>Property</th>
-                ${visibleCredentials.map((c, i) => `<th>Credential #${i + 1} (${c.id.slice(0, 8)}...)</th>`).join("")}
+              <tr style={{ background: "var(--bg-subtle, #f1f5f9)" }}>
+                <th style={{ width: "200px", padding: "0.75rem", textAlign: "left", border: "1px solid var(--card-border)" }}>
+                  Field
+                </th>
+                <th style={{ padding: "0.75rem", textAlign: "left", border: "1px solid var(--card-border)" }}>
+                  Before
+                </th>
+                <th style={{ padding: "0.75rem", textAlign: "left", border: "1px solid var(--card-border)" }}>
+                  After
+                </th>
+                <th style={{ width: "100px", padding: "0.75rem", textAlign: "left", border: "1px solid var(--card-border)" }}>
+                  Change
+                </th>
               </tr>
             </thead>
             <tbody>
-              <tr>
-                <td><strong>Verification Status</strong></td>
-                ${visibleCredentials
-                  .map((c) => {
-                    const st = getCredentialVerificationStatus(c);
-                    return `<td><span class="badge ${st.status}">${st.label}</span></td>`;
-                  })
-                  .join("")}
-              </tr>
-              <tr class="${isTypeDiff ? "diff" : ""}">
-                <td><strong>Credential Type</strong></td>
-                ${visibleCredentials.map((c) => `<td>${c.credentialType}</td>`).join("")}
-              </tr>
-              <tr class="${isIssuerDiff ? "diff" : ""}">
-                <td><strong>Issuer</strong></td>
-                ${visibleCredentials.map((c) => `<td style="font-family: monospace;">${c.issuer}</td>`).join("")}
-              </tr>
-              <tr>
-                <td><strong>Issuer Reputation Score</strong></td>
-                ${visibleCredentials.map((c) => `<td>${reputationScores[c.issuer] ?? "N/A"}/100</td>`).join("")}
-              </tr>
-              <tr class="${isExpiryDiff ? "diff" : ""}">
-                <td><strong>Expires At</strong></td>
-                ${visibleCredentials
-                  .map((c) => `<td>${c.expiresAt === 0 ? "No Expiry" : formatTimestamp(c.expiresAt)}</td>`)
-                  .join("")}
-              </tr>
-              ${claimDiffs
-                .map(
-                  (d) => `
-                <tr class="${d.hasDifference ? "diff" : ""}">
-                  <td><strong>Claim: ${d.key}</strong></td>
-                  ${visibleCredentials.map((c) => `<td>${c.claims[d.key] || '<span style="color:#94a3b8">(none)</span>'}</td>`).join("")}
+              {filteredVersionDiff.length === 0 ? (
+                <tr>
+                  <td
+                    colSpan={4}
+                    style={{
+                      padding: "1rem",
+                      textAlign: "center",
+                      color: "var(--text-muted)",
+                      border: "1px solid var(--card-border)",
+                    }}
+                  >
+                    {showOnlyChanges
+                      ? "No changes between these versions."
+                      : "No fields to display."}
+                  </td>
                 </tr>
-              `
-                )
-                .join("")}
+              ) : (
+                filteredVersionDiff.map((change) => (
+                  <tr key={change.key} style={{ background: changeRowBackground(change.kind) }}>
+                    <td
+                      style={{
+                        padding: "0.75rem",
+                        fontWeight: 600,
+                        border: "1px solid var(--card-border)",
+                        background: "var(--bg-subtle)",
+                        wordBreak: "break-word",
+                      }}
+                    >
+                      {change.key}
+                    </td>
+                    <td
+                      style={{
+                        padding: "0.75rem",
+                        border: "1px solid var(--card-border)",
+                        color: change.before ? "var(--text)" : "var(--text-muted)",
+                        fontStyle: change.before ? "normal" : "italic",
+                        wordBreak: "break-word",
+                      }}
+                    >
+                      {change.before ?? "(not present)"}
+                    </td>
+                    <td
+                      style={{
+                        padding: "0.75rem",
+                        border: "1px solid var(--card-border)",
+                        color: change.after ? "var(--text)" : "var(--text-muted)",
+                        fontStyle: change.after ? "normal" : "italic",
+                        wordBreak: "break-word",
+                      }}
+                    >
+                      {change.after ?? "(not present)"}
+                    </td>
+                    <td style={{ padding: "0.75rem", border: "1px solid var(--card-border)" }}>
+                      <span
+                        style={{
+                          padding: "0.15rem 0.45rem",
+                          borderRadius: "4px",
+                          fontSize: "0.7rem",
+                          fontWeight: 700,
+                          textTransform: "uppercase",
+                          ...changeBadgeStyle(change.kind),
+                        }}
+                      >
+                        {change.kind}
+                      </span>
+                    </td>
+                  </tr>
+                ))
+              )}
             </tbody>
           </table>
-        </body>
-      </html>
-    `;
+        </div>
 
-    // Download formatted report or trigger print to PDF
-    const printWindow = window.open("", "_blank");
-    if (printWindow) {
-      printWindow.document.write(reportHtml);
-      printWindow.document.close();
-      printWindow.focus();
-      setTimeout(() => {
-        printWindow.print();
-      }, 300);
-    } else {
-      // Fallback to text file download
-      const blob = new Blob([reportHtml], { type: "application/pdf" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `credential-comparison-${Date.now()}.html`;
-      a.click();
-      URL.revokeObjectURL(url);
-    }
-  };
+        {/* Legend */}
+        <div
+          style={{
+            marginTop: "1rem",
+            display: "flex",
+            alignItems: "center",
+            gap: "1.5rem",
+            fontSize: "0.8rem",
+            color: "var(--text-muted)",
+            flexWrap: "wrap",
+          }}
+        >
+          {(["added", "removed", "modified"] as FieldChangeKind[]).map((kind) => (
+            <div key={kind} style={{ display: "flex", alignItems: "center", gap: "0.4rem" }}>
+              <span
+                style={{
+                  display: "inline-block",
+                  width: "14px",
+                  height: "14px",
+                  borderRadius: "3px",
+                  ...changeBadgeStyle(kind),
+                }}
+              />
+              <span style={{ textTransform: "capitalize" }}>{kind}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
 
-  if (visibleCredentials.length < 2) {
+  if (visibleCredentials.length < MIN_COMPARE) {
     return (
       <div
         style={{
@@ -333,10 +777,49 @@ export const CredentialComparison: React.FC<CredentialComparisonProps> = ({
             <span style={{ fontWeight: 600 }}>Show Only Differences</span>
           </label>
 
+          {/* Copy comparison link */}
+          <button
+            type="button"
+            onClick={handleCopyLink}
+            style={{
+              background: "transparent",
+              color: "var(--accent, #7c3aed)",
+              border: "1px solid var(--accent, #7c3aed)",
+              borderRadius: "6px",
+              padding: "0.45rem 1rem",
+              fontSize: "0.85rem",
+              fontWeight: 600,
+              cursor: "pointer",
+            }}
+          >
+            Copy comparison link
+          </button>
+
+          {/* Export Image Button */}
+          <button
+            type="button"
+            onClick={handleExportImage}
+            disabled={isExporting}
+            style={{
+              background: "transparent",
+              color: "var(--accent, #7c3aed)",
+              border: "1px solid var(--accent, #7c3aed)",
+              borderRadius: "6px",
+              padding: "0.45rem 1rem",
+              fontSize: "0.85rem",
+              fontWeight: 600,
+              cursor: isExporting ? "not-allowed" : "pointer",
+              opacity: isExporting ? 0.6 : 1,
+            }}
+          >
+            Export as Image
+          </button>
+
           {/* Export PDF Button */}
           <button
             type="button"
             onClick={handleExportPDF}
+            disabled={isExporting}
             style={{
               background: "var(--accent, #7c3aed)",
               color: "#ffffff",
@@ -345,13 +828,32 @@ export const CredentialComparison: React.FC<CredentialComparisonProps> = ({
               padding: "0.45rem 1rem",
               fontSize: "0.85rem",
               fontWeight: 600,
-              cursor: "pointer",
+              cursor: isExporting ? "not-allowed" : "pointer",
+              opacity: isExporting ? 0.6 : 1,
             }}
           >
             Export as PDF
           </button>
         </div>
       </div>
+
+      {/* Toast confirmation */}
+      {toast && (
+        <div
+          role="status"
+          style={{
+            marginBottom: "1rem",
+            padding: "0.5rem 0.75rem",
+            borderRadius: "6px",
+            background: "var(--badge-green-bg, #dcfce7)",
+            color: "var(--badge-green-text, #166534)",
+            fontSize: "0.85rem",
+            fontWeight: 600,
+          }}
+        >
+          {toast}
+        </div>
+      )}
 
       {/* Comparison Multi-Column Table / Grid */}
       <div style={{ overflowX: "auto" }}>

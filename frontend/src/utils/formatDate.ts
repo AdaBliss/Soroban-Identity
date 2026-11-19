@@ -15,37 +15,50 @@ function getDateFnsLocale() {
   return DATE_FNS_LOCALES[currentLang] || enUS;
 }
 
-const MAX_DATE_SECONDS = 8_640_000_000_000; // Max ECMAScript Date in seconds (8.64e15 ms)
+const MAX_DATE_MS = 8_640_000_000_000_000; // ECMAScript max Date millisecond value
+const MAX_DATE_SECS = 8_640_000_000_000;
 
-function normalizeUnixSeconds(value: number | bigint | string): number {
-  const num = typeof value === 'bigint' ? Number(value) : Number(value);
-  if (!Number.isFinite(num)) return 0;
-  return num < 0 ? num >>> 0 : num;
+export function normalizeUnixTimestamp(value: number | bigint | string): number {
+  const num = typeof value === 'bigint' ? Number(value) : typeof value === 'string' ? Number(value) : value;
+  if (!Number.isFinite(num) || num <= 0) return 0;
+  // Unsigned 32-bit wrap-around recovery if a negative 32-bit signed int was produced
+  if (num < 0) {
+    return num + 0x100000000;
+  }
+  return num;
 }
 
-export function formatDate(value: string | number): string {
-  const ms = typeof value === 'number' ? normalizeUnixSeconds(value) * 1000 : value;
+export function formatDate(value: string | number | bigint): string {
+  if (typeof value === 'string' && !/^\d+$/.test(value.trim())) {
+    const date = new Date(value);
+    return isNaN(date.getTime()) ? String(value) : formatFns(date, 'PPP', { locale: getDateFnsLocale() });
+  }
+  const unix = normalizeUnixTimestamp(value);
+  if (unix >= MAX_DATE_SECS) {
+    return 'Far future (max timestamp)';
+  }
+  const ms = Math.min(unix * 1000, MAX_DATE_MS);
   const date = new Date(ms);
   if (Number.isNaN(date.getTime())) {
-    return typeof value === 'number' ? `Unix ${normalizeUnixSeconds(value)}` : String(value);
+    return typeof value === 'number' ? `Unix ${normalizeUnixTimestamp(value)}` : String(value);
   }
   return formatFns(date, 'PPP', { locale: getDateFnsLocale() });
 }
 
-export function formatTimestamp(unix: number): string {
-  const sec = normalizeUnixSeconds(unix);
-  if (sec === 0) return 'No expiry';
-  if (sec > MAX_DATE_SECONDS) return `Unix ${sec}`;
-  const date = new Date(sec * 1000);
-  if (Number.isNaN(date.getTime())) return `Unix ${sec}`;
+export function formatTimestamp(unix: number | bigint): string {
+  const normalized = normalizeUnixTimestamp(unix);
+  if (normalized === 0) return 'No expiry';
+  if (normalized >= MAX_DATE_SECS) return 'Far future (max timestamp)';
+  const date = new Date(Math.min(normalized * 1000, MAX_DATE_MS));
   return formatFns(date, 'PPpp', { locale: getDateFnsLocale() });
 }
 
-export function getExpiryStyle(unix: number): React.CSSProperties {
-  const sec = normalizeUnixSeconds(unix);
-  if (sec === 0) return { color: 'var(--text-muted)' };
-  const diffSec = sec - Date.now() / 1000;
-  if (diffSec < 0) return { color: 'var(--text-muted)' };
-  if (diffSec < 7 * 24 * 60 * 60) return { color: 'var(--warning)', fontWeight: 600 };
+export function getExpiryStyle(unix: number | bigint): React.CSSProperties {
+  const normalized = normalizeUnixTimestamp(unix);
+  if (normalized === 0) return { color: 'var(--text-muted)' };
+  if (normalized >= MAX_DATE_SECS) return {};
+  const diffMs = normalized * 1000 - Date.now();
+  if (diffMs < 0) return { color: 'var(--text-muted)' };
+  if (diffMs < 7 * 24 * 60 * 60 * 1000) return { color: 'var(--warning)', fontWeight: 600 };
   return {};
 }
