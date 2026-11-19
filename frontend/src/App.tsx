@@ -19,6 +19,7 @@ const CredentialsPanel = lazy(() => import("./components/CredentialsPanel"));
 const IssuerDashboard = lazy(() => import("./pages/IssuerDashboard"));
 const CredentialRecipientVerify = lazy(() => import("./components/CredentialRecipientVerify"));
 const NetworkStatistics = lazy(() => import("./components/NetworkStatistics"));
+const ActivityFeed = lazy(() => import("./components/ActivityFeed"));
 const CustomizableDashboard = lazy(() => import("./components/CustomizableDashboard"));
 const PrivacySettings = lazy(() => import("./components/privacy/PrivacySettings"));
 const { isShareLinkExpired } = await import("./components/privacy/shareLinks");
@@ -31,6 +32,9 @@ const preloadCredentialRecipientVerify = () => {
 };
 const preloadNetworkStatistics = () => {
   void import("./components/NetworkStatistics");
+};
+const preloadActivityFeed = () => {
+  void import("./components/ActivityFeed");
 };
 const preloadCustomizableDashboard = () => {
   void import("./components/CustomizableDashboard");
@@ -76,6 +80,7 @@ export enum Tab {
   Credentials = "credentials",
   IssuerAnalytics = "issuerAnalytics",
   NetworkStatistics = "networkStatistics",
+  ActivityFeed = "activityFeed",
   CredentialAnalytics = "credentialAnalytics",
   Dashboard = "dashboard",
   Privacy = "privacy",
@@ -86,6 +91,7 @@ const TAB_ORDER: Tab[] = [
   Tab.Credentials,
   Tab.IssuerAnalytics,
   Tab.NetworkStatistics,
+  Tab.ActivityFeed,
   Tab.CredentialAnalytics,
   Tab.Dashboard,
   Tab.Privacy,
@@ -708,22 +714,26 @@ function AppContent() {
                 ? preloadCredentialsPanel
                 : name === Tab.NetworkStatistics
                   ? preloadNetworkStatistics
-                  : name === Tab.Dashboard
-                    ? preloadCustomizableDashboard
-                    : name === Tab.Privacy
-                      ? preloadPrivacySettings
-                      : undefined
+                  : name === Tab.ActivityFeed
+                    ? preloadActivityFeed
+                    : name === Tab.Dashboard
+                      ? preloadCustomizableDashboard
+                      : name === Tab.Privacy
+                        ? preloadPrivacySettings
+                        : undefined
             }
             onFocus={
               name === Tab.Credentials
                 ? preloadCredentialsPanel
                 : name === Tab.NetworkStatistics
                   ? preloadNetworkStatistics
-                  : name === Tab.Dashboard
-                    ? preloadCustomizableDashboard
-                    : name === Tab.Privacy
-                      ? preloadPrivacySettings
-                      : undefined
+                  : name === Tab.ActivityFeed
+                    ? preloadActivityFeed
+                    : name === Tab.Dashboard
+                      ? preloadCustomizableDashboard
+                      : name === Tab.Privacy
+                        ? preloadPrivacySettings
+                        : undefined
             }
           >
             {t(`tabs.${name}`)}
@@ -869,6 +879,24 @@ function AppContent() {
             {tab === Tab.Activity && (
               <ActivityFeed network={activeNetwork} publicKey={wallet.publicKey} />
             )}
+          </div>
+          <div
+            id={`panel-${Tab.NetworkStatistics}`}
+            role="tabpanel"
+            aria-labelledby={`tab-${Tab.NetworkStatistics}`}
+            data-tour="panel-network"
+            hidden={tab !== Tab.NetworkStatistics}
+          >
+            {tab === Tab.NetworkStatistics && <NetworkStatistics />}
+          </div>
+          <div
+            id={`panel-${Tab.ActivityFeed}`}
+            role="tabpanel"
+            aria-labelledby={`tab-${Tab.ActivityFeed}`}
+            data-tour="panel-activity"
+            hidden={tab !== Tab.ActivityFeed}
+          >
+            {tab === Tab.ActivityFeed && <ActivityFeed />}
           </div>
           </ViewTransition>
           </Suspense>

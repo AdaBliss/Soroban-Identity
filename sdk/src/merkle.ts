@@ -9,6 +9,7 @@ export interface MerkleProofStep {
   position: "left" | "right";
   siblingOnLeft?: boolean;
   index?: number;
+  data?: string;
 }
 
 export interface MerkleTree {
@@ -107,6 +108,7 @@ export function generateMerkleProof(
     if (siblingIdx < nodes.length) {
       siblings.push({
         hash: nodes[siblingIdx]!,
+        data: nodes[siblingIdx]!,
         index: siblingIdx,
         siblingOnLeft: isRightNode,
         position: isRightNode ? "left" : "right",
@@ -139,8 +141,10 @@ export function verifyMerkleProof(proof: any, root?: string): boolean {
   }
   if (!current) return false;
   for (const node of path) {
-    if (!node || !/^[0-9a-fA-F]{64}$/.test(node.hash)) return false;
-    const sibling = node.hash.toLowerCase();
+    if (!node) return false;
+    const siblingHash = node.hash ?? node.data;
+    if (!siblingHash || !/^[0-9a-fA-F]{64}$/.test(siblingHash)) return false;
+    const sibling = siblingHash.toLowerCase();
     const isLeft = node.siblingOnLeft ?? node.position === "left";
     current = isLeft ? hashNodes(sibling, current) : hashNodes(current, sibling);
   }

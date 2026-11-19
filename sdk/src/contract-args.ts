@@ -1012,11 +1012,15 @@ export function buildUpdateMerkleRootArgs(params: {
   proof?: unknown;
 }): xdr.ScVal[] {
   const hex = params.batchId.startsWith("0x") ? params.batchId.slice(2) : params.batchId;
-  return [
+  const args = [
     nativeToScVal(params.issuer, { type: "address" }),
     nativeToScVal(Buffer.from(hex, "hex"), { type: "bytes" }),
     nativeToScVal(params.newRoot, { type: "bytes" }),
   ];
+  if (params.proof) {
+    args.push(nativeToScVal(params.proof));
+  }
+  return args;
 }
 
 export function buildVerifyMerkleProofArgs(params: {
@@ -1024,6 +1028,9 @@ export function buildVerifyMerkleProofArgs(params: {
   proof: unknown;
 }): xdr.ScVal[] {
   const hex = params.batchId.startsWith("0x") ? params.batchId.slice(2) : params.batchId;
-  return [nativeToScVal(Buffer.from(hex, "hex"), { type: "bytes" })];
+  return [
+    nativeToScVal(Buffer.from(hex, "hex"), { type: "bytes" }),
+    nativeToScVal(params.proof),
+  ];
 }
 

@@ -340,6 +340,7 @@ impl Reputation {
     pub fn initialize(env: Env, admin: Address) -> Result<(), ContractError> {
         Self::require_uninitialized(&env)?;
         Self::set_admin(&env, &admin);
+        env.storage().instance().extend_ttl(TTL_MAX, TTL_MAX);
         // #949: the rate-limit window is not written here — every read falls
         // back to DEFAULT_MIN_INTERVAL, so storing the default at deploy time
         // only adds a ledger write to the initialization transaction.
@@ -736,7 +737,7 @@ impl Reputation {
             .get(&history_key)
             .unwrap_or_else(|| Vec::new(&env));
 
-        let is_new_reporter = history.is_empty();
+        let _is_new_reporter = history.is_empty();
 
         if history.len() >= MAX_HISTORY as u32 {
             history.remove(0);
@@ -809,6 +810,12 @@ impl Reputation {
         env.storage()
             .persistent()
             .extend_ttl(&rec_key, TTL_MAX, TTL_MAX);
+
+        let lrep_key = Self::last_reporter_key(&subject);
+        env.storage().persistent().set(&lrep_key, &reporter);
+        env.storage()
+            .persistent()
+            .extend_ttl(&lrep_key, TTL_MAX, TTL_MAX);
 
         // Update subject count only on first submission
         if is_new_subject {
@@ -984,7 +991,7 @@ impl Reputation {
         };
         let len = filtered.len();
         let start = offset.min(len);
-        let end = (start + effective_limit).min(len);
+        let end = start.saturating_add(effective_limit).min(len);
         let mut page = Vec::new(&env);
         for i in start..end {
             page.push_back(filtered.get(i).unwrap());
@@ -1054,6 +1061,7 @@ impl Reputation {
         env.storage()
             .persistent()
             .extend_ttl(&dispute_key, TTL_MAX, TTL_MAX);
+        env.storage().instance().extend_ttl(TTL_MAX, TTL_MAX);
 
         // Emit dispute_filed event
         env.events().publish(
@@ -1096,13 +1104,12 @@ impl Reputation {
         if dispute.resolved {
             return Err(ContractError::DisputeAlreadyResolved);
         }
-        if env.ledger().sequence() > dispute.opened_at + DISPUTE_WINDOW_LEDGERS {
+        if env.ledger().sequence() > dispute.opened_at.saturating_add(DISPUTE_WINDOW_LEDGERS) {
             return Err(ContractError::DisputeExpired);
         }
 
         let now = env.ledger().timestamp();
         if accepted {
-            let now = env.ledger().timestamp();
             let history_key = Self::history_key(&subject, &reporter);
             let mut history: Vec<ScoreEntry> = env
                 .storage()
@@ -1255,11 +1262,12 @@ impl Reputation {
             return Err(ContractError::InsufficientStake);
         }
 
-        record.unlock_at = env.ledger().sequence() + STAKE_COOLDOWN_LEDGERS;
+        record.unlock_at = env.ledger().sequence().saturating_add(STAKE_COOLDOWN_LEDGERS);
         env.storage().persistent().set(&key, &record);
         env.storage()
             .persistent()
             .extend_ttl(&key, TTL_MAX, TTL_MAX);
+        env.storage().instance().extend_ttl(TTL_MAX, TTL_MAX);
 
         env.events().publish(
             (STAKE, symbol_short!("unstkreq")),
@@ -2393,7 +2401,7 @@ impl Reputation {
             .persistent()
             .get::<(Symbol, Address, Address), u32>(&rate_key)
         {
-            if current_ledger <= last_ledger + min_interval {
+            if current_ledger <= last_ledger.saturating_add(min_interval) {
                 return Err(ContractError::RateLimitExceeded);
             }
         }
@@ -2424,7 +2432,7 @@ impl Reputation {
             .persistent()
             .get::<(Symbol, Address, Address), u32>(&rate_key)
         {
-            if current_ledger <= last_ledger + min_interval {
+            if current_ledger <= last_ledger.saturating_add(min_interval) {
                 return Err(ContractError::RateLimitExceeded);
             }
         }
