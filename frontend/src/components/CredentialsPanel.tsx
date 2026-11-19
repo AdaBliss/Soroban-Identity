@@ -7,7 +7,7 @@ import { validateStellarAddress } from "../../../sdk/src/utils";
 import { getNetworkConfig } from '../network';
 import SkeletonCard from "./SkeletonCard";
 import FormField from "./FormField";
-import { formatTimestamp } from "../utils/formatDate";
+import { formatTimestamp, formatLedgerExpiry } from "../utils/formatDate";
 import { handleError } from "../utils/handleError";
 import { useWalletContext } from "../context/WalletContext";
 import { useToast } from "../context/ToastContext";
@@ -1567,7 +1567,7 @@ export default function CredentialsPanel({ verifyId, wallet: propWallet }: { ver
                       </div>
                       <div style={{ display: "flex", gap: "1rem", marginBottom: "0.5rem" }}>
                         <dt style={{ fontWeight: 600, color: "var(--text-muted)", minWidth: "120px" }}>Expires</dt>
-                        <dd style={{ margin: 0, ...getExpiryStyle(cred.expiresAt) }}>{formatTimestamp(cred.expiresAt)}</dd>
+                        <dd style={{ margin: 0, ...getExpiryStyle(cred.expiresAt) }}>{formatLedgerExpiry(cred.expiresAt)}</dd>
                       </div>
                       <div style={{ display: "flex", gap: "1rem", marginBottom: "0.5rem" }}>
                         <dt style={{ fontWeight: 600, color: "var(--text-muted)", minWidth: "120px" }}>Version</dt>

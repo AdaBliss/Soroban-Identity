@@ -124,6 +124,30 @@ export default function IdentityPanel({ wallet: propWallet }: { wallet?: any } =
   const [createResult, setCreateResult] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
 
+  // ── Creation wizard (#1299) ────────────────────────────────────────────
+  const [createStep, setCreateStep] = useState(1);
+  const [createDid, setCreateDid] = useState('');
+  const [createDidError, setCreateDidError] = useState<string | null>(null);
+
+  /** Validates the DID field on step 3: required, non-whitespace. */
+  const validateCreateDid = (value: string): string | null => {
+    if (!value.trim()) return 'DID is required';
+    return null;
+  };
+
+  const handleCreateNext = () => {
+    if (createStep === 3) {
+      const error = validateCreateDid(createDid);
+      setCreateDidError(error);
+      if (error) return;
+    }
+    setCreateStep((s) => Math.min(s + 1, 3));
+  };
+
+  const handleCreateBack = () => {
+    setCreateStep((s) => Math.max(s - 1, 1));
+  };
+
   const [metadataEntries, setMetadataEntries] = useState<Array<{ key: string; value: string }>>([]);
   const [metadataError, setMetadataError] = useState<string | null>(null);
   const [updating, setUpdating] = useState(false);
@@ -236,6 +260,15 @@ export default function IdentityPanel({ wallet: propWallet }: { wallet?: any } =
   const handleCreate = async () => {
     if (creating) return; // guard against duplicate submissions
     if (!wallet.connected || !wallet.publicKey) return;
+
+    // Step 3 validation: DID is required (#1299)
+    const didError = validateCreateDid(createDid);
+    setCreateDidError(didError);
+    if (didError) {
+      toast.error(didError);
+      return;
+    }
+
     setCreating(true);
     setCreateResult(null);
     try {
@@ -993,14 +1026,64 @@ export default function IdentityPanel({ wallet: propWallet }: { wallet?: any } =
                 {wallet.publicKey.slice(0, 6)}…{wallet.publicKey.slice(-4)}
               </span>
             </p>
-            <button
-              onClick={handleCreate}
-              disabled={creating}
-              data-tour="create-did-button"
-              data-tour-create-did="create-did"
-            >
-              {creating ? 'Creating…' : 'Create DID'}
-            </button>
+            {createStep === 3 && (
+              <div style={{ marginBottom: '1rem' }}>
+                <label htmlFor="create-did-input" style={{ display: 'block', fontSize: '0.85rem', color: 'var(--text-muted)', marginBottom: '0.5rem' }}>
+                  DID <span aria-hidden="true">*</span>
+                </label>
+                <input
+                  id="create-did-input"
+                  type="text"
+                  required
+                  aria-required="true"
+                  aria-invalid={createDidError ? true : undefined}
+                  aria-describedby={createDidError ? 'create-did-error' : undefined}
+                  placeholder="DID (required)"
+                  value={createDid}
+                  onChange={(e) => {
+                    setCreateDid(e.target.value);
+                    if (createDidError) setCreateDidError(validateCreateDid(e.target.value));
+                  }}
+                  onBlur={() => setCreateDidError(validateCreateDid(createDid))}
+                  style={{
+                    width: '100%',
+                    padding: '0.5rem',
+                    borderRadius: '0.25rem',
+                    border: `1px solid ${createDidError ? 'var(--danger-border)' : 'var(--border-light)'}`,
+                  }}
+                />
+                {createDidError && (
+                  <p
+                    id="create-did-error"
+                    role="alert"
+                    style={{ color: 'var(--danger-text)', fontSize: '0.75rem', margin: '0.25rem 0 0 0' }}
+                  >
+                    {createDidError}
+                  </p>
+                )}
+              </div>
+            )}
+            <div style={{ display: 'flex', gap: '0.5rem' }}>
+              {createStep > 1 && (
+                <button type="button" onClick={handleCreateBack} disabled={creating}>
+                  Back
+                </button>
+              )}
+              {createStep < 3 ? (
+                <button type="button" onClick={handleCreateNext}>
+                  Next
+                </button>
+              ) : (
+                <button
+                  onClick={handleCreate}
+                  disabled={creating}
+                  data-tour="create-did-button"
+                  data-tour-create-did="create-did"
+                >
+                  {creating ? 'Creating…' : 'Create DID'}
+                </button>
+              )}
+            </div>
             {creating && <SkeletonCard variant="identity" />}
           </>
         ) : (
