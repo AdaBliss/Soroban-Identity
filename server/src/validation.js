@@ -18,6 +18,85 @@ export const STELLAR_ACCOUNT_RE = /^G[A-Z2-7]{55}$/;
 /** DID for this network: `did:stellar:<Stellar account>`. */
 export const DID_RE = /^did:stellar:(G[A-Z2-7]{55})$/;
 
+/** Human-readable description of the expected DID format. */
+export const DID_FORMAT_MESSAGE = 'Must be a valid DID of the form did:stellar:<STELLAR_ACCOUNT>';
+
+/**
+ * Check whether a value is a well-formed DID for this network. Never throws,
+ * so malformed input (non-strings, objects, oversized values) is reported as
+ * invalid rather than surfacing as an unhandled exception (#1304).
+ *
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+export function isValidDid(value) {
+  if (typeof value !== 'string') return false;
+  const candidate = sanitizeString(value);
+  if (!candidate || candidate.length > 256) return false;
+  return DID_RE.test(candidate);
+}
+
+/**
+ * Validate a DID input and return a structured result suitable for a 400
+ * response when invalid. Route handlers can use this to reject malformed DID
+ * input before processing instead of letting it throw a 500 (#1304).
+ *
+ * @param {unknown} value
+ * @param {string} [field]
+ * @returns {{ ok: true, did: string } | { ok: false, error: { error: string, code: string, message: string, errors: Array<{ field: string, source: string, message: string, code: string }> } }}
+ */
+export function validateDid(value, field = 'did') {
+  if (typeof value !== 'string') {
+    return {
+      ok: false,
+      error: {
+        error: 'validation_failed',
+        code: 'VALIDATION_FAILED',
+        message: 'Request validation failed.',
+        errors: [
+          {
+            field,
+            source: field,
+            message: `${DID_FORMAT_MESSAGE} (received ${value === null ? 'null' : typeof value})`,
+            code: 'invalid_type',
+          },
+        ],
+      },
+    };
+  }
+
+  const did = sanitizeString(value);
+  if (!isValidDid(did)) {
+    return {
+      ok: false,
+      error: {
+        error: 'validation_failed',
+        code: 'VALIDATION_FAILED',
+        message: 'Request validation failed.',
+        errors: [{ field, source: field, message: DID_FORMAT_MESSAGE, code: 'invalid_string' }],
+      },
+    };
+  }
+
+  return { ok: true, did };
+}
+
+/**
+ * Send a 400 response when `value` is not a valid DID. Returns the normalized
+ * DID on success, or `null` after responding on failure.
+ *
+ * @param {import('node:http').ServerResponse} res
+ * @param {unknown} value
+ * @param {string} [field]
+ * @returns {string | null}
+ */
+export function requireValidDid(res, value, field = 'did') {
+  const result = validateDid(value, field);
+  if (result.ok) return result.did;
+  sendJson(res, 400, result.error);
+  return null;
+}
+
 /**
  * Replace lone UTF-16 surrogates with U+FFFD and normalize to NFC so special
  * Unicode (emoji, accented text, CJK, RTL marks, unpaired surrogates) never
@@ -107,7 +186,7 @@ export const schemas = {
     body: z
       .object({
         did: z.string().transform(sanitizeString).refine((v) => DID_RE.test(v), {
-          message: 'Must be a valid DID of the form did:stellar:<STELLAR_ACCOUNT>',
+          message: DID_FORMAT_MESSAGE,
         }).optional(),
         address: z.string().transform(sanitizeString).refine((v) => STELLAR_ACCOUNT_RE.test(v), {
           message: 'Must be a valid Stellar account address (G followed by 55 base32 characters)',

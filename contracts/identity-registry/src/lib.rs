@@ -657,6 +657,8 @@ impl IdentityRegistry {
     /// Returns [`ContractError::DidNotFound`] / [`ContractError::DidDeactivated`]
     /// depending on the resolved document's state.
     pub fn resolve_did_string(env: Env, did: String) -> Result<ResolvedDid, ContractError> {
+        // `did_resolver::resolve` returns `Result` and never panics on an
+        // unknown DID; propagate the error to the caller instead of trapping.
         did_resolver::resolve(&env, &did)
     }
 
@@ -803,6 +805,8 @@ impl IdentityRegistry {
     /// document fails validation, or [`ContractError::DidNotFound`] if every
     /// resolver in the fallback chain fails.
     pub fn resolve_did_universal(env: Env, did: String) -> Result<resolver::ResolvedDid, ContractError> {
+        // `resolver::resolve_universal` returns `Result` and never panics on an
+        // unknown DID; propagate the error to the caller instead of trapping.
         resolver::resolve_universal(&env, &did)
     }
 
@@ -1166,6 +1170,26 @@ mod tests {
         let (env, client) = setup();
         let user = Address::generate(&env);
         assert_eq!(client.try_resolve_did(&user), Err(Ok(ContractError::DidNotFound)));
+    }
+
+    /// #1301 BUG-04: resolving an unknown DID string must return an error
+    /// rather than panicking/trapping the host.
+    #[test]
+    fn test_resolve_unknown_did_string_returns_error() {
+        let (env, client) = setup();
+        let unknown = String::from_str(&env, "did:stellar:GUNKNOWNUNKNOWNUNKNOWNUNKNOWNUNKNOWNUNKNOWNUNKNOWNUNKNOWN");
+        let result = client.try_resolve_did_string(&unknown);
+        assert!(result.is_err());
+    }
+
+    /// #1301 BUG-04: the universal resolver must also return an error for an
+    /// unknown DID instead of panicking.
+    #[test]
+    fn test_resolve_unknown_did_universal_returns_error() {
+        let (env, client) = setup();
+        let unknown = String::from_str(&env, "did:stellar:GUNKNOWNUNKNOWNUNKNOWNUNKNOWNUNKNOWNUNKNOWNUNKNOWNUNKNOWN");
+        let result = client.try_resolve_did_universal(&unknown);
+        assert!(result.is_err());
     }
 
     #[test]

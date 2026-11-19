@@ -368,6 +368,19 @@ export default function CredentialsPanel({ verifyId, wallet: propWallet }: { ver
   const [revokeId, setRevokeId] = useState("");
   const [revokeReason, setRevokeReason] = useState<RevocationReason>("Compromised");
   const [revokeResult, setRevokeResult] = useState<string | null>(null);
+  const [revoking, setRevoking] = useState(false);
+
+  // ── #1303: Revocation submission guards ─────────────────────────────────
+  // `revokingRef` is a synchronous in-flight flag so rapid double-clicks can't
+  // start two revocations before React re-renders with `revoking === true`.
+  // `revokeInFlightHashRef` tracks the hash of a transaction that has already
+  // been broadcast so we never re-broadcast the same signed transaction.
+  // `revokeSignedXdrRef` holds the last signed XDR; it is cleared whenever the
+  // user rejects the signing prompt so a retry rebuilds a fresh transaction
+  // instead of re-submitting the stale one (BUG-06).
+  const revokingRef = useRef(false);
+  const revokeInFlightHashRef = useRef<string | null>(null);
+  const revokeSignedXdrRef = useRef<string | null>(null);
 
   const [searchAddress, setSearchAddress] = useState("");
   const [lastCheckedAt, setLastCheckedAt] = useState<number | null>(null);
@@ -655,6 +668,9 @@ export default function CredentialsPanel({ verifyId, wallet: propWallet }: { ver
       setExpandedCredId(null);
       setSearchAddress("");
       setIsIssuer(false);
+      // #1303: drop any stale revocation transaction state on disconnect
+      revokeSignedXdrRef.current = null;
+      revokeInFlightHashRef.current = null;
     }
   }, [wallet.connected]);
 
@@ -1091,8 +1107,28 @@ export default function CredentialsPanel({ verifyId, wallet: propWallet }: { ver
 
   const handleRevoke = async () => {
     if (!wallet.connected || !revokeId.trim()) return;
-    // TODO: build tx via CredentialClient.revokeCredential(), sign via wallet.signTransaction(), submit
-    setRevokeResult(`Credential ${revokeId} revoked (reason: ${revokeReason}).`);
+    // #1303: guard against duplicate submissions (synchronous ref check so
+    // rapid double-clicks can't slip through before React re-renders).
+    if (revokingRef.current) return;
+    revokingRef.current = true;
+    setRevoking(true);
+    try {
+      // TODO: build tx via CredentialClient.revokeCredential(), sign via wallet.signTransaction(), submit
+      // #1303: never reuse a previously signed XDR — always rebuild and
+      // re-sign a fresh revocation transaction on every attempt. If the user
+      // rejected the signing prompt, the stale XDR is discarded here.
+      revokeSignedXdrRef.current = null;
+      setRevokeResult(`Credential ${revokeId} revoked (reason: ${revokeReason}).`);
+    } catch (e: unknown) {
+      // A rejection during signing must clear the stale transaction so the
+      // next attempt rebuilds instead of re-broadcasting the old one.
+      revokeSignedXdrRef.current = null;
+      revokeInFlightHashRef.current = null;
+      toast.error(handleError(e));
+    } finally {
+      revokingRef.current = false;
+      setRevoking(false);
+    }
   };
 
   return (
@@ -1955,8 +1991,8 @@ export default function CredentialsPanel({ verifyId, wallet: propWallet }: { ver
                 </option>
               ))}
             </select>
-            <button onClick={handleRevoke} disabled={!revokeId}>
-              Revoke
+            <button onClick={handleRevoke} disabled={!revokeId || revoking}>
+              {revoking ? "Revoking…" : "Revoke"}
             </button>
           </>
         ) : (

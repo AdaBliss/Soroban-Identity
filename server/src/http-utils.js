@@ -426,6 +426,48 @@ export function notFound(res, req = null) {
 }
 
 /**
+ * Send a 400 Bad Request response with a descriptive error code and message.
+ *
+ * Route handlers use this to turn malformed client input into a consistent
+ * client error instead of letting an exception bubble up as a 500.
+ *
+ * @param {object} req - HTTP request object (for content negotiation)
+ * @param {object} res - HTTP response object
+ * @param {string} message - Human-readable description of the problem
+ * @param {string} [code="BAD_REQUEST"] - Machine-readable error code
+ * @param {object} [extra={}] - Additional fields to include in the body
+ */
+export function badRequest(req, res, message, code = "BAD_REQUEST", extra = {}) {
+  const body = {
+    error: "bad_request",
+    code,
+    message,
+    ...extra,
+  };
+  if (req) {
+    return sendFormatted(req, res, 400, body);
+  }
+  sendJson(res, 400, body);
+}
+
+/**
+ * Send a 400 response describing a malformed DID input.
+ *
+ * @param {object} req - HTTP request object (for content negotiation)
+ * @param {object} res - HTTP response object
+ * @param {*} did - The offending DID value supplied by the client
+ * @param {string} [detail] - Optional extra detail about why it is invalid
+ */
+export function badDid(req, res, did, detail) {
+  const message = detail
+    ? `Invalid DID: ${detail}`
+    : "Invalid DID: expected a string in the form did:<method>:<identifier>";
+  return badRequest(req, res, message, "INVALID_DID", {
+    did: typeof did === "string" ? did : undefined,
+  });
+}
+
+/**
  * Authenticate and authorize a request with optional scope requirements.
  * 
  * @param {object} req - HTTP request object

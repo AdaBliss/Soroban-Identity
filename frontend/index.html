@@ -48,6 +48,39 @@
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <meta name="apple-mobile-web-app-title" content="Soroban ID" />
+
+    <!-- Theme bootstrap: apply persisted theme before first paint to avoid a light-theme flash -->
+    <script>
+      (function () {
+        try {
+          var stored = null;
+          try {
+            stored = window.localStorage.getItem('theme-preference');
+          } catch (e) {}
+          if (stored !== 'dark' && stored !== 'light') {
+            var legacy = null;
+            try {
+              legacy = window.localStorage.getItem('dark-mode');
+            } catch (e) {}
+            if (legacy === 'true') stored = 'dark';
+            else if (legacy === 'false') stored = 'light';
+          }
+          if (stored !== 'dark' && stored !== 'light') {
+            stored =
+              window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches
+                ? 'dark'
+                : 'light';
+          }
+          var root = document.documentElement;
+          root.classList.remove('dark', 'light');
+          root.classList.add(stored);
+          root.setAttribute('data-theme', stored);
+          root.setAttribute('data-theme-mode', stored);
+          root.setAttribute('data-theme-preference', stored);
+          root.style.colorScheme = stored;
+        } catch (e) {}
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>
