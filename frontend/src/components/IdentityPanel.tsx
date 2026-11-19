@@ -82,8 +82,9 @@ function validateMetadataFields(
   };
 }
 
-export default function IdentityPanel() {
-  const wallet = useWalletContext();
+export default function IdentityPanel({ wallet: propWallet }: { wallet?: any } = {}) {
+  const contextWallet = useWalletContext();
+  const wallet = propWallet ?? contextWallet;
   const toast = useToast();
   const [identityState, dispatch] = useReducer(identityReducer, { status: 'idle' });
   const resolving = identityState.status === 'loading';
@@ -586,6 +587,7 @@ export default function IdentityPanel() {
         <input
           id="resolve-address"
           data-tour="resolve-did-input"
+          data-tour-resolve-did="resolve-did"
           placeholder="Stellar address (G…)"
           value={resolveAddress}
           onChange={(e) => setResolveAddress(e.target.value)}
@@ -690,7 +692,9 @@ export default function IdentityPanel() {
 
         {!resolving && resolvedAddress && (
           <>
-            <div style={{ 
+            <div
+              data-tour="did-document"
+              style={{ 
               display: 'flex', 
               alignItems: 'center', 
               gap: '0.5rem', 
@@ -989,7 +993,12 @@ export default function IdentityPanel() {
                 {wallet.publicKey.slice(0, 6)}…{wallet.publicKey.slice(-4)}
               </span>
             </p>
-            <button onClick={handleCreate} disabled={creating} data-tour="create-did-button">
+            <button
+              onClick={handleCreate}
+              disabled={creating}
+              data-tour="create-did-button"
+              data-tour-create-did="create-did"
+            >
               {creating ? 'Creating…' : 'Create DID'}
             </button>
             {creating && <SkeletonCard variant="identity" />}
@@ -999,7 +1008,9 @@ export default function IdentityPanel() {
             Connect your Freighter wallet to create a new on-chain DID.
           </p>
         )}
-        {!creating && createResult && <pre className="result">{createResult}</pre>}
+        <div data-tour="did-status">
+          {!creating && createResult && <pre className="result">{createResult}</pre>}
+        </div>
       </div>
 
       <div className="card">
