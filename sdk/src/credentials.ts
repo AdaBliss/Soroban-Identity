@@ -561,19 +561,27 @@ export class CredentialClient extends BaseClient {
       const estimatedFeeXlm = (estimatedFee / 10_000_000).toFixed(7);
       prepared.sign(issuerKeypair);
 
-      const result = await retryWithBackoff(() => this.server.sendTransaction(prepared));
+      const txHash = Buffer.from(prepared.hash()).toString('hex');
+      let result;
+      try {
+        result = await this.server.sendTransaction(prepared);
+      } catch (error) {
+        const wrapped = error instanceof Error ? error : new Error(String(error));
+        Object.assign(wrapped, { txHash, submissionUnknown: true });
+        throw wrapped;
+      }
       this.debug('sdk.submission_outcome', { operation: 'credentials.sendTransaction', status: result.status });
       if (result.status !== "PENDING") {
         throw new SorobanIdentityError(`Transaction failed: ${result.status}`, "CONTRACT_ERROR");
       }
 
-      const txHash = result.hash;
-      await pollTransactionStatus(this.server, txHash, {
+      const submittedTxHash = result.hash;
+      await pollTransactionStatus(this.server, submittedTxHash, {
         maxRetries: this.config.maxRetries ?? this.config.pollingRetries,
         retryIntervalMs: this.config.retryIntervalMs ?? this.config.pollingIntervalMs,
         exponentialBackoff: this.config.pollingExponentialBackoff,
       });
-      const confirmed = await this.server.getTransaction(txHash) as SorobanRpc.Api.GetSuccessfulTransactionResponse;
+      const confirmed = await this.server.getTransaction(submittedTxHash) as SorobanRpc.Api.GetSuccessfulTransactionResponse;
       // Returns BytesN<32> — encode as hex
       const decoded = scValToNative(confirmed.returnValue!);
       const raw = decoded instanceof Uint8Array
@@ -582,7 +590,7 @@ export class CredentialClient extends BaseClient {
           ? confirmed.returnValue
           : Buffer.alloc(32);
       const credentialId = Buffer.from(raw).toString("hex");
-      return { data: { credentialId, estimatedFee, estimatedFeeXlm }, txHash };
+      return { data: { credentialId, estimatedFee, estimatedFeeXlm }, txHash: submittedTxHash };
     };
 
     try {

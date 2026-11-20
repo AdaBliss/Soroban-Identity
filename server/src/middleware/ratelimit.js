@@ -158,6 +158,9 @@ export class AdvancedRateLimiter {
   }
 
   check(req, pathname) {
+    if (String((req ?? request)?.method ?? "").toUpperCase() === "OPTIONS") {
+      return { allowed: true, whitelisted: true, bypass: "cors_preflight", scope: "preflight" };
+    }
     if (this.isPremium(req)) {
       this.stats.bypassed += 1;
       this.metrics?.observeRateLimitDecision?.({ outcome: 'bypass', scope: 'premium' });

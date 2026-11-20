@@ -64,6 +64,8 @@ pub enum ContractError {
     ResolverPluginError = 29,
     /// The fallback chain is empty or exceeds the maximum supported length.
     InvalidFallbackChain = 30,
+    /// An existing IPFS CID cannot be changed or removed.
+    CidImmutable = 31,
 }
 
 /// Version returned by `ping` for deployment health checks.
@@ -399,6 +401,7 @@ impl IdentityRegistry {
         if !doc.active {
             return Err(ContractError::DidDeactivated);
         }
+        Self::ensure_cid_immutable(&env, &doc.metadata, &metadata)?;
         doc.metadata = metadata;
         doc.updated_at = env.ledger().timestamp();
         storage.set(&key, &doc);
@@ -487,7 +490,7 @@ impl IdentityRegistry {
                 if !doc.active {
                     return Err(ContractError::DidDeactivated);
                 }
-                
+                Self::ensure_cid_immutable(&env, &doc.metadata, &metadata)?;
                 Ok(())
             })();
             
@@ -946,6 +949,22 @@ impl IdentityRegistry {
         env.storage().instance().set(&TOTAL_DIDS, &(total + 1));
         env.events().publish((IDENTITY, symbol_short!("created")), (EVENT_VERSION, controller.clone(), now));
         Ok(did_id)
+    }
+
+    fn ensure_cid_immutable(
+        env: &Env,
+        existing: &Map<String, String>,
+        updated: &Map<String, String>,
+    ) -> Result<(), ContractError> {
+        for key_name in ["cid", "ipfs_cid"] {
+            let key = String::from_str(env, key_name);
+            if let Some(old_cid) = existing.get(key.clone()) {
+                if updated.get(key) != Some(old_cid) {
+                    return Err(ContractError::CidImmutable);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn validate_metadata(metadata: &Map<String, String>) -> Result<(), ContractError> {
