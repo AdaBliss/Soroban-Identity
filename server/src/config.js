@@ -571,6 +571,36 @@ export function loadConfig(env = process.env) {
     circuitBreakerEnabled: parseBoolean(env.CIRCUIT_BREAKER_ENABLED, true),
     // EVENT_POLL_INTERVAL_MS=0 disables the event poller (allowZero: true)
     eventPollIntervalMs: parseInteger(env.EVENT_POLL_INTERVAL_MS, 5000, true),
+    // #1272 BE-08: Horizon event indexer service. Polls Horizon for contract
+    // events and persists them to PostgreSQL. Disabled by default so an
+    // existing deployment is unaffected until it is explicitly turned on.
+    indexerEnabled: parseBoolean(env.INDEXER_ENABLED, false),
+    indexerHorizonUrl:
+      env.HORIZON_URL ?? "https://horizon-testnet.stellar.org",
+    // Comma-separated list of contract ids to index. Empty means every
+    // contract event Horizon returns is stored.
+    indexerContractIds: parseList(env.INDEXER_CONTRACT_IDS, []),
+    // INDEXER_POLL_INTERVAL_MS=0 disables polling (allowZero: true)
+    indexerPollIntervalMs: parseInteger(
+      env.INDEXER_POLL_INTERVAL_MS,
+      5000,
+      true,
+    ),
+    // PostgreSQL connection used by the indexer. DATABASE_URL takes
+    // precedence; the discrete settings are the fallback.
+    indexerDatabaseUrl: env.DATABASE_URL ?? "",
+    indexerDbHost: env.DB_HOST ?? "localhost",
+    indexerDbPort: parseInteger(env.DB_PORT, 5432),
+    indexerDbName: env.DB_NAME ?? "soroban_indexer",
+    indexerDbUser: env.DB_USER ?? "postgres",
+    indexerDbPassword: env.DB_PASSWORD ?? "",
+    indexerDbPoolMax: parseInteger(env.DB_POOL_MAX, 10),
+    indexerDbConnectionTimeoutMs: parseInteger(
+      env.DB_CONNECTION_TIMEOUT_MS,
+      5000,
+    ),
+    // #1325 BUG-28: indexer timestamps are stored in UTC as well.
+    indexerDbTimezone: resolveDbTimezone(env),
     // #750: GET /events/poll long-polling. Timeout is clamped to
     // [1s, longPollMaxTimeoutMs] regardless of what a caller requests.
     longPollDefaultTimeoutMs: parseInteger(env.LONG_POLL_DEFAULT_TIMEOUT_MS, 30_000),
@@ -706,6 +736,10 @@ export function validateConfig(env = process.env) {
     { key: "RPC_RETRY_BASE_MS", desc: "must be a valid integer" },
     { key: "RPC_RETRY_BACKOFF", desc: "must be a valid integer" },
     { key: "EVENT_POLL_INTERVAL_MS", desc: "must be a valid integer" },
+    { key: "INDEXER_POLL_INTERVAL_MS", desc: "must be a valid integer" },
+    { key: "DB_PORT", desc: "must be a valid integer" },
+    { key: "DB_POOL_MAX", desc: "must be a valid integer" },
+    { key: "DB_CONNECTION_TIMEOUT_MS", desc: "must be a valid integer" },
     { key: "LONG_POLL_DEFAULT_TIMEOUT_MS", desc: "must be a valid integer" },
     { key: "LONG_POLL_MAX_TIMEOUT_MS", desc: "must be a valid integer" },
     { key: "RATE_LIMIT_MAX_BUCKETS", desc: "must be a valid integer" },
@@ -857,6 +891,37 @@ export function validateConfig(env = process.env) {
     );
   }
 
+  // #1272 BE-08: Horizon event indexer. When enabled it needs a usable
+  // Horizon URL and a database to write to.
+  const indexerEnabled = parseBoolean(env.INDEXER_ENABLED, false);
+  const horizonUrl = env.HORIZON_URL;
+  if (horizonUrl !== undefined && horizonUrl !== "") {
+    try {
+      new URL(horizonUrl);
+    } catch {
+      invalid.push("HORIZON_URL: must be a valid URL");
+    }
+  }
+  if (indexerEnabled) {
+    const databaseUrl = env.DATABASE_URL;
+    if (databaseUrl !== undefined && databaseUrl !== "") {
+      try {
+        const parsed = new URL(databaseUrl);
+        if (parsed.protocol !== "postgres:" && parsed.protocol !== "postgresql:") {
+          invalid.push(
+            "DATABASE_URL: must use the postgres:// or postgresql:// scheme",
+          );
+        }
+      } catch {
+        invalid.push("DATABASE_URL: must be a valid URL");
+      }
+    } else if (!env.DB_NAME) {
+      invalid.push(
+        "DATABASE_URL or DB_NAME: required when INDEXER_ENABLED is true",
+      );
+    }
+  }
+
   const cronSchedule = env.EXPIRY_CRON_SCHEDULE;
   if (cronSchedule !== undefined && cronSchedule !== "") {
     try {
@@ -944,6 +1009,21 @@ export function logDefaultValues(env = process.env) {
     { key: "RPC_RETRY_BASE_MS", defaultVal: "500" },
     { key: "RPC_RETRY_BACKOFF", defaultVal: "2" },
     { key: "EVENT_POLL_INTERVAL_MS", defaultVal: "5000" },
+    { key: "INDEXER_ENABLED", defaultVal: "false" },
+    {
+      key: "HORIZON_URL",
+      defaultVal: "'https://horizon-testnet.stellar.org'",
+    },
+    { key: "INDEXER_CONTRACT_IDS", defaultVal: "'' (all contracts)" },
+    { key: "INDEXER_POLL_INTERVAL_MS", defaultVal: "5000" },
+    { key: "DATABASE_URL", defaultVal: "'' (discrete DB_* settings)" },
+    { key: "DB_HOST", defaultVal: "'localhost'" },
+    { key: "DB_PORT", defaultVal: "5432" },
+    { key: "DB_NAME", defaultVal: "'soroban_indexer'" },
+    { key: "DB_USER", defaultVal: "'postgres'" },
+    { key: "DB_PASSWORD", defaultVal: "''" },
+    { key: "DB_POOL_MAX", defaultVal: "10" },
+    { key: "DB_CONNECTION_TIMEOUT_MS", defaultVal: "5000" },
     { key: "LONG_POLL_DEFAULT_TIMEOUT_MS", defaultVal: "30000" },
     { key: "LONG_POLL_MAX_TIMEOUT_MS", defaultVal: "60000" },
     { key: "QUOTA_OVERAGE_MODE", defaultVal: "'block'" },

@@ -1,5 +1,6 @@
 use soroban_sdk::{symbol_short, Address, Env, Vec};
 use crate::keys::{ADMIN, ISSUER};
+use crate::roles::{self, Role};
 use crate::threshold::{SignedPayload, SignerSet};
 
 pub fn initialize(env: &Env, admin: Address) {
@@ -25,10 +26,13 @@ pub fn require_issuer(env: &Env, issuer: &Address) {
     if !get_issuers(env).contains(issuer) {
         panic!("not a registered issuer");
     }
+    if !roles::has_role(env, issuer, Role::Issuer) && !roles::has_role(env, issuer, Role::Owner) {
+        panic!("caller lacks issuer role");
+    }
 }
 
 pub fn add_issuer(env: &Env, issuer: Address) {
-    require_admin(env);
+    roles::require_owner(env);
     let mut issuers = get_issuers(env);
     if !issuers.contains(&issuer) {
         issuers.push_back(issuer.clone());
@@ -38,7 +42,7 @@ pub fn add_issuer(env: &Env, issuer: Address) {
 }
 
 pub fn remove_issuer(env: &Env, issuer: Address) {
-    require_admin(env);
+    roles::require_owner(env);
     let issuers = get_issuers(env);
     let mut updated = Vec::new(env);
     for i in issuers.iter() {

@@ -1744,6 +1744,317 @@ mod tests {
         );
     }
 
+    // ── DID registry lifecycle tests (#1271) ─────────────────────────────────
+
+    /// `create_did` stores an active document with the expected fields and
+    /// emits a `created` event carrying the controller and timestamp.
+    #[test]
+    fn test_create_did_success_stores_document_and_emits_event() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::TryFromVal;
+
+        let (env, client) = setup();
+        let user = Address::generate(&env);
+        let mut metadata: Map<String, String> = Map::new(&env);
+        metadata.set(String::from_str(&env, "name"), String::from_str(&env, "alice"));
+
+        let did_id = client.create_did(&user, &metadata);
+        assert_eq!(did_id.len(), 68);
+
+        let doc = client.resolve_did(&user);
+        assert!(doc.active);
+        assert_eq!(doc.controller, user);
+        assert_eq!(doc.id, did_id);
+        assert_eq!(doc.created_at, doc.updated_at);
+        assert_eq!(doc.metadata.get(String::from_str(&env, "name")), Some(String::from_str(&env, "alice")));
+        assert_eq!(client.get_did_count(), 1);
+
+        // The `created` event must be emitted with the controller as subject.
+        let events = env.events().all();
+        let mut found = false;
+        for event in events.iter() {
+            let topics: Vec<soroban_sdk::Val> = event.1.clone();
+            if topics.len() == 2 {
+                let t0 = Symbol::try_from_val(&env, &topics.get(0).unwrap());
+                let t1 = Symbol::try_from_val(&env, &topics.get(1).unwrap());
+                if t0 == Ok(IDENTITY) && t1 == Ok(symbol_short!("created")) {
+                    found = true;
+                }
+            }
+        }
+        assert!(found, "expected a `created` event to be emitted");
+    }
+
+    /// Creating a DID twice for the same controller must return DidAlreadyExists
+    /// and must not bump the DID counters a second time.
+    #[test]
+    fn test_create_did_duplicate_returns_error() {
+        let (env, client) = setup();
+        let user = Address::generate(&env);
+        client.create_did(&user, &Map::new(&env));
+
+        let result = client.try_create_did(&user, &Map::new(&env));
+        assert_eq!(result, Err(Ok(ContractError::DidAlreadyExists)));
+        assert_eq!(client.get_did_count(), 1);
+        let stats = client.get_storage_stats();
+        assert_eq!(stats.total_dids, 1);
+        assert_eq!(stats.active_dids, 1);
+    }
+
+    /// `create_did` with an empty metadata map is allowed (metadata is optional).
+    #[test]
+    fn test_create_did_empty_metadata_succeeds() {
+        let (env, client) = setup();
+        let user = Address::generate(&env);
+        let metadata: Map<String, String> = Map::new(&env);
+        let did_id = client.create_did(&user, &metadata);
+        assert_eq!(did_id.len(), 68);
+        let doc = client.resolve_did(&user);
+        assert!(doc.metadata.is_empty());
+    }
+
+    /// `create_did` with too many metadata entries returns MetadataTooLarge.
+    #[test]
+    fn test_create_did_metadata_too_large_returns_error() {
+        let (env, client) = setup();
+        let user = Address::generate(&env);
+        let mut metadata: Map<String, String> = Map::new(&env);
+        for i in 0..11u32 {
+            let mut buf = [b'k', b'0', b'0'];
+            buf[1] = b'0' + (i / 10) as u8;
+            buf[2] = b'0' + (i % 10) as u8;
+            metadata.set(
+                String::from_bytes(&env, &buf),
+                String::from_str(&env, "v"),
+            );
+        }
+        assert_eq!(
+            client.try_create_did(&user, &metadata),
+            Err(Ok(ContractError::MetadataTooLarge))
+        );
+        assert!(!client.did_exists(&user));
+    }
+
+    /// `create_did` with an over-long metadata value returns MetadataTooLong.
+    #[test]
+    fn test_create_did_metadata_value_too_long_returns_error() {
+        let (env, client) = setup();
+        let user = Address::generate(&env);
+        let mut metadata: Map<String, String> = Map::new(&env);
+        let mut long_value = [b'x'; 257];
+        long_value[0] = b'x';
+        metadata.set(
+            String::from_str(&env, "key"),
+            String::from_bytes(&env, &long_value),
+        );
+        assert_eq!(
+            client.try_create_did(&user, &metadata),
+            Err(Ok(ContractError::MetadataTooLong))
+        );
+    }
+
+    /// `resolve_did` returns the stored document for an active DID.
+    #[test]
+    fn test_resolve_did_success() {
+        let (env, client) = setup();
+        let user = Address::generate(&env);
+        client.create_did(&user, &Map::new(&env));
+        let doc = client.resolve_did(&user);
+        assert!(doc.active);
+        assert_eq!(doc.controller, user);
+        assert_eq!(doc.delegation_depth, 0);
+        assert_eq!(doc.parent, user);
+    }
+
+    /// `resolve_did` for an address with no DID returns DidNotFound.
+    #[test]
+    fn test_resolve_did_missing_returns_error() {
+        let (env, client) = setup();
+        let user = Address::generate(&env);
+        assert_eq!(client.try_resolve_did(&user), Err(Ok(ContractError::DidNotFound)));
+    }
+
+    /// `resolve_did` for a deactivated DID returns DidDeactivated.
+    #[test]
+    fn test_resolve_did_deactivated_returns_error() {
+        let (env, client) = setup();
+        let user = Address::generate(&env);
+        client.create_did(&user, &Map::new(&env));
+        client.deactivate_did(&user);
+        assert_eq!(client.try_resolve_did(&user), Err(Ok(ContractError::DidDeactivated)));
+    }
+
+    /// `update_did` replaces metadata and advances `updated_at`.
+    #[test]
+    fn test_update_did_success() {
+        let (env, client) = setup();
+        let user = Address::generate(&env);
+        client.create_did(&user, &Map::new(&env));
+        let before = client.resolve_did(&user);
+
+        env.ledger().with_mut(|li| li.timestamp += 100);
+
+        let mut metadata: Map<String, String> = Map::new(&env);
+        metadata.set(String::from_str(&env, "name"), String::from_str(&env, "bob"));
+        client.update_did(&user, &metadata);
+
+        let after = client.resolve_did(&user);
+        assert_eq!(after.metadata.get(String::from_str(&env, "name")), Some(String::from_str(&env, "bob")));
+        assert_eq!(after.created_at, before.created_at);
+        assert!(after.updated_at > before.updated_at);
+    }
+
+    /// `update_did` with empty metadata returns EmptyMetadata.
+    #[test]
+    fn test_update_did_empty_metadata_returns_error() {
+        let (env, client) = setup();
+        let user = Address::generate(&env);
+        client.create_did(&user, &Map::new(&env));
+        assert_eq!(
+            client.try_update_did(&user, &Map::new(&env)),
+            Err(Ok(ContractError::EmptyMetadata))
+        );
+    }
+
+    /// `update_did` for an address with no DID returns DidNotFound.
+    #[test]
+    fn test_update_did_missing_returns_error() {
+        let (env, client) = setup();
+        let user = Address::generate(&env);
+        let mut metadata: Map<String, String> = Map::new(&env);
+        metadata.set(String::from_str(&env, "name"), String::from_str(&env, "bob"));
+        assert_eq!(
+            client.try_update_did(&user, &metadata),
+            Err(Ok(ContractError::DidNotFound))
+        );
+    }
+
+    /// `update_did` on a deactivated DID returns DidDeactivated.
+    #[test]
+    fn test_update_did_deactivated_returns_error() {
+        let (env, client) = setup();
+        let user = Address::generate(&env);
+        client.create_did(&user, &Map::new(&env));
+        client.deactivate_did(&user);
+        let mut metadata: Map<String, String> = Map::new(&env);
+        metadata.set(String::from_str(&env, "name"), String::from_str(&env, "bob"));
+        assert_eq!(
+            client.try_update_did(&user, &metadata),
+            Err(Ok(ContractError::DidDeactivated))
+        );
+    }
+
+    /// `update_did` requires the controller's authorization: without it the
+    /// host rejects the call (auth failure), so the update never lands.
+    #[test]
+    fn test_update_did_unauthorized_caller_is_rejected() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, IdentityRegistry);
+        let client = IdentityRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.initialize(&admin);
+        client.create_did(&user, &Map::new(&env));
+
+        // From here on, no auths are mocked: the controller's signature is missing.
+        env.set_auths(&[]);
+        let mut metadata: Map<String, String> = Map::new(&env);
+        metadata.set(String::from_str(&env, "name"), String::from_str(&env, "mallory"));
+        let result = client.try_update_did(&user, &metadata);
+        assert!(result.is_err());
+
+        // The original metadata is untouched.
+        env.mock_all_auths();
+        let doc = client.resolve_did(&user);
+        assert!(doc.metadata.is_empty());
+    }
+
+    /// `deactivate_did` flips `active` to false, decrements the active count and
+    /// emits a `deact` event.
+    #[test]
+    fn test_deactivate_did_success_emits_event() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::TryFromVal;
+
+        let (env, client) = setup();
+        let user = Address::generate(&env);
+        client.create_did(&user, &Map::new(&env));
+        assert_eq!(client.get_did_count(), 1);
+
+        client.deactivate_did(&user);
+
+        assert_eq!(client.get_did_count(), 0);
+        assert!(!client.has_active_did(&user));
+        assert!(client.did_exists(&user));
+        let stats = client.get_storage_stats();
+        assert_eq!(stats.total_dids, 1);
+        assert_eq!(stats.active_dids, 0);
+
+        let events = env.events().all();
+        let mut found = false;
+        for event in events.iter() {
+            let topics: Vec<soroban_sdk::Val> = event.1.clone();
+            if topics.len() == 2 {
+                let t0 = Symbol::try_from_val(&env, &topics.get(0).unwrap());
+                let t1 = Symbol::try_from_val(&env, &topics.get(1).unwrap());
+                if t0 == Ok(IDENTITY) && t1 == Ok(symbol_short!("deact")) {
+                    found = true;
+                }
+            }
+        }
+        assert!(found, "expected a `deact` event to be emitted");
+    }
+
+    /// Deactivating an already-deactivated DID returns DidDeactivated and does
+    /// not decrement the count again.
+    #[test]
+    fn test_deactivate_did_already_deactivated_returns_error() {
+        let (env, client) = setup();
+        let user = Address::generate(&env);
+        client.create_did(&user, &Map::new(&env));
+        client.deactivate_did(&user);
+        assert_eq!(
+            client.try_deactivate_did(&user),
+            Err(Ok(ContractError::DidDeactivated))
+        );
+        assert_eq!(client.get_did_count(), 0);
+    }
+
+    /// Deactivating a DID that was never created returns DidNotFound.
+    #[test]
+    fn test_deactivate_did_missing_returns_error() {
+        let (env, client) = setup();
+        let user = Address::generate(&env);
+        assert_eq!(
+            client.try_deactivate_did(&user),
+            Err(Ok(ContractError::DidNotFound))
+        );
+    }
+
+    /// `deactivate_did` requires the controller's authorization.
+    #[test]
+    fn test_deactivate_did_unauthorized_caller_is_rejected() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, IdentityRegistry);
+        let client = IdentityRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.initialize(&admin);
+        client.create_did(&user, &Map::new(&env));
+
+        env.set_auths(&[]);
+        let result = client.try_deactivate_did(&user);
+        assert!(result.is_err());
+
+        env.mock_all_auths();
+        assert!(client.has_active_did(&user));
+        assert_eq!(client.get_did_count(), 1);
+    }
+
     /// #866: an access only extends the TTL once it has dropped below
     /// `TTL_BUMP_THRESHOLD`, instead of on every call.
     #[test]

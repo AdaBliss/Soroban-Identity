@@ -149,4 +149,10 @@ pub enum CredentialManagerError {
     PresentationExpired = 35,
     /// The presentation proof format is not supported.
     UnsupportedProofFormat = 36,
+    /// The requested role was not found.
+    RoleNotFound = 37,
+    /// The caller's role does not grant the required capability.
+    InsufficientRole = 38,
+    /// The role has already been granted to the account.
+    RoleAlreadyGranted = 39,
 }

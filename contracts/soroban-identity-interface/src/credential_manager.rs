@@ -5,7 +5,7 @@ use credential_manager::{
     CredentialTemplate, CredentialTypeDescriptor, CredentialType, ContractError, DataFeedSchema,
     Escrow, EscrowConditions, EscrowDeposit, EscrowStatus, IssuersPage, OracleConfig,
     OracleRequest, OracleResponse, PresentationTemplate, RevocationProof, RevocationReason,
-    RevocationRecord, RevocationStats, SignatureScheme, SignedPayload, SignerSet,
+    RevocationRecord, RevocationStats, Role, SignatureScheme, SignedPayload, SignerSet,
     VerifiablePresentation,
 };
 use soroban_sdk::{Address, Bytes, BytesN, Env, Map, String, Vec};
@@ -36,6 +36,27 @@ pub trait CredentialManagerInterface {
         new_wasm_hash: BytesN<32>,
         timelock_duration: Option<u32>,
     ) -> Result<(), ContractError>;
+
+    // ── Role-based access control (#1270) ───────────────────────────────────
+
+    /// Grant `role` to `account`. Only the owner (admin) may grant roles.
+    fn grant_role(
+        env: Env,
+        admin: Address,
+        account: Address,
+        role: Role,
+    ) -> Result<(), ContractError>;
+
+    /// Revoke `role` from `account`. Only the owner (admin) may revoke roles.
+    fn revoke_role(
+        env: Env,
+        admin: Address,
+        account: Address,
+        role: Role,
+    ) -> Result<(), ContractError>;
+
+    /// The role currently held by `account`, if any.
+    fn get_role(env: Env, account: Address) -> Option<Role>;
 
     fn add_issuer(env: Env, issuer: Address) -> Result<(), ContractError>;
 
@@ -127,6 +148,23 @@ pub trait CredentialManagerInterface {
         env: Env,
         credential_id: BytesN<32>,
     ) -> Result<RevocationRecord, ContractError>;
+
+    // ── Attestation revocation (#1269) ──────────────────────────────────────
+
+    /// Mark an attestation claim as revoked. Only the attestation's issuer
+    /// (or the owner) may revoke it.
+    fn revoke_attestation(
+        env: Env,
+        caller: Address,
+        credential_id: BytesN<32>,
+        reason: RevocationReason,
+    ) -> Result<(), ContractError>;
+
+    /// Verify an attestation, failing if it has been revoked.
+    fn verify_attestation(
+        env: Env,
+        credential_id: BytesN<32>,
+    ) -> Result<(), ContractError>;
 
     // ── Bitmap revocation list (#1121) ──────────────────────────────────────
 
@@ -445,6 +483,28 @@ impl CredentialManagerInterface for CredentialManager {
         Self::upgrade(env, admin, new_wasm_hash, timelock_duration)
     }
 
+    fn grant_role(
+        env: Env,
+        admin: Address,
+        account: Address,
+        role: Role,
+    ) -> Result<(), ContractError> {
+        Self::grant_role(env, admin, account, role)
+    }
+
+    fn revoke_role(
+        env: Env,
+        admin: Address,
+        account: Address,
+        role: Role,
+    ) -> Result<(), ContractError> {
+        Self::revoke_role(env, admin, account, role)
+    }
+
+    fn get_role(env: Env, account: Address) -> Option<Role> {
+        Self::get_role(env, account)
+    }
+
     fn add_issuer(env: Env, issuer: Address) -> Result<(), ContractError> {
         Self::add_issuer(env, issuer)
     }
@@ -572,6 +632,22 @@ impl CredentialManagerInterface for CredentialManager {
         credential_id: BytesN<32>,
     ) -> Result<RevocationRecord, ContractError> {
         Self::get_revocation(env, credential_id)
+    }
+
+    fn revoke_attestation(
+        env: Env,
+        caller: Address,
+        credential_id: BytesN<32>,
+        reason: RevocationReason,
+    ) -> Result<(), ContractError> {
+        Self::revoke_attestation(env, caller, credential_id, reason)
+    }
+
+    fn verify_attestation(
+        env: Env,
+        credential_id: BytesN<32>,
+    ) -> Result<(), ContractError> {
+        Self::verify_attestation(env, credential_id)
     }
 
     fn batch_revoke(
