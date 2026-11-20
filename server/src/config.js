@@ -394,6 +394,21 @@ export function loadConfig(env = process.env) {
     credentialStorePath: env.CREDENTIAL_STORE_PATH
       ? path.resolve(env.CREDENTIAL_STORE_PATH)
       : path.join(DEFAULT_DATA_DIR, "credentials.json"),
+    // #1288 BE-24: DID document version history. Each update appends a
+    // snapshot so GET /identity/:did/history can replay prior versions.
+    didHistoryEnabled: parseBoolean(env.DID_HISTORY_ENABLED, true),
+    didHistoryPath: env.DID_HISTORY_PATH
+      ? path.resolve(env.DID_HISTORY_PATH)
+      : path.join(DEFAULT_DATA_DIR, "did-history.json"),
+    // Maximum number of historical versions retained per DID (0 = unlimited).
+    didHistoryMaxVersions: parseInteger(env.DID_HISTORY_MAX_VERSIONS, 50, true),
+    // #1290 BE-26: issuer whitelist management. The whitelist itself lives
+    // on-chain; this path caches the locally known entries so admin reads do
+    // not require an RPC round-trip on every request.
+    issuerWhitelistPath: env.ISSUER_WHITELIST_PATH
+      ? path.resolve(env.ISSUER_WHITELIST_PATH)
+      : path.join(DEFAULT_DATA_DIR, "issuer-whitelist.json"),
+    issuerWhitelistCacheTtlMs: parseInteger(env.ISSUER_WHITELIST_CACHE_TTL_MS, 30_000, true),
     rateLimitWhitelist: (env.RATE_LIMIT_WHITELIST ?? "")
       .split(",")
       .map((entry) => entry.trim())
@@ -719,6 +734,8 @@ export function validateConfig(env = process.env) {
     { key: "OAUTH_ACCESS_TOKEN_TTL_MS", desc: "must be a valid integer" },
     { key: "OAUTH_REFRESH_TOKEN_TTL_MS", desc: "must be a valid integer" },
     { key: "REQUEST_NONCE_TTL_SECONDS", desc: "must be a valid integer" },
+    { key: "DID_HISTORY_MAX_VERSIONS", desc: "must be a valid integer" },
+    { key: "ISSUER_WHITELIST_CACHE_TTL_MS", desc: "must be a valid integer" },
   ];
 
   for (const item of numericVars) {
@@ -866,6 +883,24 @@ export function validateConfig(env = process.env) {
     }
   }
 
+  // #1288 BE-24: DID history must be enabled for the history endpoint to
+  // serve anything, and its retention limit must be a non-negative integer.
+  if (env.DID_HISTORY_ENABLED !== undefined && env.DID_HISTORY_ENABLED !== "") {
+    const normalized = String(env.DID_HISTORY_ENABLED).trim().toLowerCase();
+    const known = ["true", "1", "yes", "on", "false", "0", "no", "off"];
+    if (!known.includes(normalized)) {
+      invalid.push("DID_HISTORY_ENABLED: must be one of true/false/1/0/yes/no/on/off");
+    }
+  }
+
+  // #1290 BE-26: issuer whitelist management requires an admin API key so the
+  // add/remove endpoints cannot be called anonymously.
+  if (!env.ADMIN_API_KEY) {
+    invalid.push(
+      "ADMIN_API_KEY: required for issuer whitelist management endpoints",
+    );
+  }
+
   const encryptionEnabled = parseBoolean(env.ENCRYPTION_ENABLED, false);
   if (encryptionEnabled) {
     const rotation = parseInteger(
@@ -974,6 +1009,11 @@ export function logDefaultValues(env = process.env) {
     { key: "REQUEST_NONCE_ENABLED", defaultVal: "false" },
     { key: "REQUEST_NONCE_TTL_SECONDS", defaultVal: "300" },
     { key: "REQUEST_NONCE_HEADER", defaultVal: "'X-Nonce'" },
+    { key: "DID_HISTORY_ENABLED", defaultVal: "true" },
+    { key: "DID_HISTORY_PATH", defaultVal: "data/did-history.json" },
+    { key: "DID_HISTORY_MAX_VERSIONS", defaultVal: "50" },
+    { key: "ISSUER_WHITELIST_PATH", defaultVal: "data/issuer-whitelist.json" },
+    { key: "ISSUER_WHITELIST_CACHE_TTL_MS", defaultVal: "30000" },
   ];
 
   for (const item of defaults) {

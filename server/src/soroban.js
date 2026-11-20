@@ -237,16 +237,85 @@ export class SorobanClient {
     return result;
   }
 
+  /**
+   * Fetch the on-chain revision/version metadata for a DID document.
+   *
+   * Used by the history reconciler to detect when the contract's view of a
+   * document has advanced past the locally stored history. Returns null when
+   * the contract does not expose version metadata or the DID is unknown, so
+   * callers can fall back to local history only.
+   *
+   * @param {string} didOrAddress - `did:stellar:G...` or a bare `G...`
+   * @returns {Promise<{address: string, version: number, updatedAt: number}|null>}
+   */
+  async getDidVersion(didOrAddress) {
+    const address = String(didOrAddress ?? '').startsWith('did:stellar:')
+      ? String(didOrAddress).slice('did:stellar:'.length)
+      : String(didOrAddress ?? '');
+
+    if (!address) return null;
+
+    let raw;
+    try {
+      raw = await this.invoke(this.config.contracts.identity, 'get_did_version', ['--address', address]);
+    } catch (error) {
+      // Older contracts may not implement get_did_version; treat as unknown
+      // rather than failing the whole history request.
+      logger.warn({ address, error: error.message }, 'get_did_version unavailable; skipping on-chain version check');
+      return null;
+    }
+
+    return parseDidVersion(raw, address);
+  }
+
+  /**
+   * Fetch the on-chain revision history for a DID document, if the contract
+   * exposes it. Returns null when unsupported so the server can serve its
+   * locally stored history instead.
+   *
+   * @param {string} didOrAddress - `did:stellar:G...` or a bare `G...`
+   * @returns {Promise<Array<object>|null>}
+   */
+  async getDidHistory(didOrAddress) {
+    const address = String(didOrAddress ?? '').startsWith('did:stellar:')
+      ? String(didOrAddress).slice('did:stellar:'.length)
+      : String(didOrAddress ?? '');
+
+    if (!address) return null;
+
+    let raw;
+    try {
+      raw = await this.invoke(this.config.contracts.identity, 'get_did_history', ['--address', address]);
+    } catch (error) {
+      logger.warn({ address, error: error.message }, 'get_did_history unavailable; using local history');
+      return null;
+    }
+
+    return parseDidHistory(raw, address);
+  }
+
   async addIssuer(issuer) {
-    this.cache.delete(`${this.config.contracts.credential}:get_issuers:[]`);
-    await this.queryCache.invalidate('get_issuers');
-    return this.invoke(this.config.contracts.credential, 'add_issuer', ['--issuer', issuer]);
+    this.invalidateIssuerCaches();
+    const raw = await this.invoke(this.config.contracts.credential, 'add_issuer', ['--issuer', issuer]);
+    // The write may have succeeded even if the response is opaque; drop caches
+    // again so the next read reflects the new whitelist.
+    this.invalidateIssuerCaches();
+    return { issuer, action: 'add', result: raw };
   }
 
   async removeIssuer(issuer) {
+    this.invalidateIssuerCaches();
+    const raw = await this.invoke(this.config.contracts.credential, 'remove_issuer', ['--issuer', issuer]);
+    this.invalidateIssuerCaches();
+    return { issuer, action: 'remove', result: raw };
+  }
+
+  /** Drop every cache entry that can hold the issuer whitelist. */
+  invalidateIssuerCaches() {
     this.cache.delete(`${this.config.contracts.credential}:get_issuers:[]`);
-    await this.queryCache.invalidate('get_issuers');
-    return this.invoke(this.config.contracts.credential, 'remove_issuer', ['--issuer', issuer]);
+    // Fire-and-forget: the distributed cache is best-effort and must not make
+    // an otherwise successful write appear to fail.
+    Promise.resolve(this.queryCache.invalidate('get_issuers')).catch(() => {});
   }
 
   async getEvents(startLedger, { fallbackFn = null } = {}) {
@@ -350,6 +419,83 @@ function runCommand(command, args, timeoutMs) {
 function parseAddressList(raw) {
   const matches = raw.match(/G[A-Z0-9]{55}/g);
   return matches ? [...new Set(matches)] : [];
+}
+
+/**
+ * Parse a `get_did_version` contract response.
+ *
+ * Accepts either a bare integer revision or an object carrying
+ * `version`/`revision` and `updated_at`/`updatedAt`. Returns null when the
+ * response cannot be interpreted.
+ */
+export function parseDidVersion(raw, address) {
+  if (raw === null || raw === undefined || raw === '') return null;
+
+  let parsed = raw;
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (trimmed === '' || trimmed === 'null') return null;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      const asNumber = Number(trimmed);
+      if (Number.isFinite(asNumber)) parsed = asNumber;
+      else return null;
+    }
+  }
+
+  if (typeof parsed === 'number') {
+    if (!Number.isFinite(parsed)) return null;
+    return { address, version: parsed, updatedAt: 0 };
+  }
+
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+
+  const version = Number(parsed.version ?? parsed.revision ?? parsed.rev ?? NaN);
+  if (!Number.isFinite(version)) return null;
+
+  return {
+    address,
+    version,
+    updatedAt: Number(parsed.updated_at ?? parsed.updatedAt ?? 0) || 0,
+  };
+}
+
+/**
+ * Parse a `get_did_history` contract response into a list of revisions.
+ *
+ * Returns null when the response is not a list, so callers can distinguish
+ * "contract does not support history" from "history is empty".
+ */
+export function parseDidHistory(raw, address) {
+  if (raw === null || raw === undefined || raw === '') return null;
+
+  let parsed = raw;
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (trimmed === '' || trimmed === 'null') return null;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      return null;
+    }
+  }
+
+  if (!Array.isArray(parsed)) return null;
+
+  return parsed
+    .map((entry, index) => {
+      if (!entry || typeof entry !== 'object') return null;
+      const version = Number(entry.version ?? entry.revision ?? index + 1);
+      if (!Number.isFinite(version)) return null;
+      return {
+        address,
+        version,
+        updatedAt: Number(entry.updated_at ?? entry.updatedAt ?? 0) || 0,
+        document: entry.document ?? entry.doc ?? null,
+      };
+    })
+    .filter(Boolean);
 }
 
 export { runCommand };
