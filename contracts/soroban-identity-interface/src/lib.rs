@@ -36,8 +36,8 @@ pub use reputation_trait::ReputationInterface;
 // dependencies on `identity-registry` / `credential-manager` / `reputation`
 // just to name the types in those trait signatures.
 pub use identity_registry::{
-    ContractError as IdentityRegistryError, DidDocument, DidResolutionResult, IdentityStorageStats,
-    ResolverMethod, ResolverPlugin, ServiceEndpoint,
+    ContractError as IdentityRegistryError, DidDocument, DidMethod, DidResolutionResult,
+    IdentityStorageStats, ResolverMethod, ResolverPlugin, ServiceEndpoint,
 };
 
 pub use credential_manager::{
