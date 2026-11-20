@@ -179,6 +179,8 @@ import {
 import { CacheManager, CACHE_TTL, cacheKey } from "./cache/index.js";
 import { MeteringService, meteringMiddleware, handleBillingRoutes } from "./billing/index.js";
 import { createRequestDeduplication } from "./middleware/dedupe.js";
+import { verifyJwt } from "./jwt-auth.js";
+import { createIpfsStorage } from "./ipfs-storage.js";
 const SERVER_VERSION = "0.1.0";
 const MIN_SDK_VERSION = "0.1.0";
 const SERVER_FEATURES = [
@@ -216,6 +218,29 @@ const CREDENTIAL_FIELDS = [
 
 const usageTracker = new UsageTracker();
 
+function contractMetadata(metadata) {
+  return Object.fromEntries(Object.entries(metadata ?? {}).map(([key, value]) => [
+    key,
+    typeof value === "string" ? value : JSON.stringify(value),
+  ]));
+}
+
+async function pinAndPersistDid({ didDoc, address, config, soroban, ipfsStorage, isUpdate }) {
+  if (!ipfsStorage?.pinJson) return didDoc;
+  const existingCid = didDoc.metadata?.cid ?? didDoc.metadata?.ipfs_cid;
+  const cid = isUpdate && existingCid ? existingCid : await ipfsStorage.pinJson(didDoc);
+  const metadata = { ...(didDoc.metadata ?? {}), cid, ipfs_cid: cid };
+  const persisted = { ...didDoc, metadata };
+  if (config.ipfsOnChainEnabled !== false && soroban?.invoke && config.contracts?.identity && config.sourceAccount) {
+    const method = isUpdate ? "update_did" : "create_did";
+    await soroban.invoke(config.contracts.identity, method, [
+      "--controller", address,
+      "--metadata", JSON.stringify(contractMetadata(metadata)),
+    ]);
+  }
+  return persisted;
+}
+
 export function createApp({
   config,
   soroban,
@@ -249,6 +274,7 @@ export function createApp({
   sessionKeyRegistry = null,
   cacheManager = null,
   meteringService = null,
+  ipfsStorage = createIpfsStorage(config),
 }) {
   // Expose the key service on config so http-utils.requireAuth can validate
   // issued API keys instead of falling back to the single admin key.
@@ -662,8 +688,22 @@ export function createApp({
           message: jwtVerdict.message,
         });
       }
+      const authVerdict = verifyJwt(bearerToken, {
+        secret: config.jwtSecret,
+        publicKey: config.jwtPublicKey,
+        algorithms: config.jwtAlgorithms,
+        issuer: config.jwtIssuer,
+        audience: config.jwtAudience,
+        clockSkewSeconds: config.jwtClockSkewSeconds ?? 30,
+      });
+      if (authVerdict.ok) {
+        req.userId = authVerdict.auth.subject;
+        req.issuer = authVerdict.auth.subject;
+        req.userTier = "issuer";
+        req.auth = { jwt: authVerdict.auth, claims: authVerdict.claims };
+      }
     }
-    if (req.headers["x-user-tier"]) {
+    if (req.headers["x-user-tier"] && !req.auth?.jwt) {
       req.userTier = req.headers["x-user-tier"].toLowerCase();
     }
 
@@ -1985,14 +2025,22 @@ export function createApp({
               metadata: safeMetadata,
               active: validated.data.body.active !== false,
             };
+            const persistedDidDoc = await pinAndPersistDid({
+              didDoc,
+              address,
+              config,
+              soroban,
+              ipfsStorage,
+              isUpdate: false,
+            });
             if (didCache) {
-              await didCache.set(address, didDoc);
+              await didCache.set(address, persistedDidDoc);
             }
-            const didLinks = buildDidLinks(didDoc, linkPrefix);
+            const didLinks = buildDidLinks(persistedDidDoc, linkPrefix);
             return sendJson(
               res,
               pathname === "/identity/did" ? 200 : 201,
-              { ...didDoc, _links: didLinks },
+              { ...persistedDidDoc, _links: didLinks },
               { Link: formatLinkHeader(didLinks) },
             );
           } catch (err) {
@@ -2073,14 +2121,22 @@ export function createApp({
                 updatedAt: Math.floor(Date.now() / 1000),
                 metadata: req.method === "PATCH" ? { ...(existing.metadata ?? {}), ...safeMetadata } : safeMetadata,
               };
+              const persistedDidDoc = await pinAndPersistDid({
+                didDoc: updatedDoc,
+                address,
+                config,
+                soroban,
+                ipfsStorage,
+                isUpdate: true,
+              });
               if (didCache) {
-                await didCache.set(address, updatedDoc);
+                await didCache.set(address, persistedDidDoc);
               }
-              const didLinks = buildDidLinks(updatedDoc, linkPrefix);
+              const didLinks = buildDidLinks(persistedDidDoc, linkPrefix);
               return sendJson(
                 res,
                 200,
-                { ...updatedDoc, _links: didLinks },
+                { ...persistedDidDoc, _links: didLinks },
                 { Link: formatLinkHeader(didLinks) },
               );
             }
@@ -2598,3 +2654,4 @@ export function createApp({
         });
     });
   };
+}

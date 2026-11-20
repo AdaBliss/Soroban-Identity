@@ -31,6 +31,13 @@ export const RATE_LIMIT_TIERS = {
     writeLimit: 500,
     maxRequests: 1200,
   },
+  issuer: {
+    name: 'issuer',
+    windowMs: 60 * 1000,
+    readLimit: 1000,
+    writeLimit: 1000,
+    maxRequests: 1000,
+  },
 };
 
 /**
