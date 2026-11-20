@@ -113,6 +113,15 @@ export const AdvancedSearch: React.FC<AdvancedSearchProps> = ({
     setSavedSearches(getSavedSearches());
   }, []);
 
+  // Reset filter state on unmount (e.g. route change) so filters do not
+  // persist when navigating away and back.
+  useEffect(() => {
+    return () => {
+      setQuery('');
+      setFilters(EMPTY_FILTERS);
+    };
+  }, []);
+
   // Run the debounced search whenever query or filters change.
   useEffect(() => {
     let cancelled = false;
