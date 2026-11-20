@@ -6,7 +6,8 @@
   "description": "Operational HTTP service for Soroban Identity contracts",
   "scripts": {
     "start": "node src/index.js",
-    "test": "node --test"
+    "test": "node --test",
+    "docs:generate": "node src/openapi-generator.js"
   },
   "engines": {
     "node": ">=20"

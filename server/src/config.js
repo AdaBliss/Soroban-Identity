@@ -423,7 +423,13 @@ export function loadConfig(env = process.env) {
     ddosCaptchaUrl: env.DDOS_CAPTCHA_URL ?? "https://challenges.cloudflare.com/turnstile/v0/siteverify",
     ddosBlockedRegions: parseList(env.DDOS_BLOCKED_REGIONS, []),
     redisUrl: env.REDIS_URL ?? "",
-    didCacheTtlMs: parseInteger(env.DID_CACHE_TTL_MS, 60 * 1000),
+    didCacheTtlMs: parseInteger(
+      env.DID_CACHE_TTL_MS ??
+        (env.DID_CACHE_TTL_SECONDS
+          ? Number(env.DID_CACHE_TTL_SECONDS) * 1000
+          : undefined),
+      60 * 1000,
+    ),
     redisMaxRetries: parseInteger(env.REDIS_MAX_RETRIES, 5),
     redisRetryBaseMs: parseInteger(env.REDIS_RETRY_BASE_MS, 200),
     redisCommandTimeoutMs: parseInteger(env.REDIS_COMMAND_TIMEOUT_MS, 1000),

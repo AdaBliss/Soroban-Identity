@@ -187,8 +187,10 @@ export class SorobanClient {
     if (!address) return null;
 
     if (this.didCache) {
-      const cached = await this.didCache.get(address);
-      if (cached) return cached;
+      try {
+        const cached = await this.didCache.get(address);
+        if (cached) return cached;
+      } catch {}
     }
 
     const raw = await this.invoke(this.config.contracts.identity, 'get_did', ['--address', address]);
@@ -197,7 +199,9 @@ export class SorobanClient {
     // Only cache a real document. Caching a negative result would let a DID
     // created moments later stay invisible for the whole TTL.
     if (document && this.didCache) {
-      await this.didCache.set(address, document);
+      try {
+        await this.didCache.set(address, document);
+      } catch {}
     }
 
     return document;
