@@ -517,7 +517,7 @@ impl IdentityRegistry {
                 doc.updated_at = now;
                 
                 storage.set(&key, &doc);
-                storage.extend_ttl(&key, TTL_LEDGERS, TTL_LEDGERS);
+                storage.extend_ttl(&key, TTL_BUMP_THRESHOLD, TTL_LEDGERS);
                 
                 // Emit update event with metadata hash
                 let mut hash_input = Self::string_to_bytes(&env, &doc.id);

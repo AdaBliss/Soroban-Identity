@@ -2,6 +2,7 @@
 // Handles offline caching and sync
 
 const CACHE_PREFIX = 'soroban-identity-';
+// Replaced with the content hash by scripts/version-service-worker.mjs during builds.
 const CACHE_VERSION = 'v2';
 const STATIC_CACHE = `${CACHE_PREFIX}static-${CACHE_VERSION}`;
 const API_CACHE = `${CACHE_PREFIX}api-${CACHE_VERSION}`;
@@ -91,12 +92,12 @@ self.addEventListener('install', (event) => {
 // Activate event - remove this app's caches from older versions. Caches
 // with other names on the same origin are left alone.
 self.addEventListener('activate', (event) => {
-  const currentCaches = [CACHE_NAME, STATIC_CACHE_NAME, API_CACHE_NAME];
+  const currentCaches = CURRENT_CACHES;
   event.waitUntil(
     caches.keys().then((cacheNames) => {
       return Promise.all(
         cacheNames.map((cacheName) => {
-          if (cacheName.startsWith(CACHE_PREFIX) && !CURRENT_CACHES.includes(cacheName)) {
+          if (cacheName.startsWith(CACHE_PREFIX) && !currentCaches.includes(cacheName)) {
             return caches.delete(cacheName);
           }
           return undefined;
@@ -431,4 +432,3 @@ self.addEventListener('message', (event) => {
     event.waitUntil(caches.delete(API_CACHE));
   }
 });
-
