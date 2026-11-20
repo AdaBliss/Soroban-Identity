@@ -270,6 +270,9 @@ export class TieredRateLimiter {
    * budget. Denials are logged so violations are visible in the access log.
    */
   check(req, pathname) {
+    if (String((req ?? request)?.method ?? "").toUpperCase() === "OPTIONS") {
+      return { allowed: true, whitelisted: true, bypass: "cors_preflight", scope: "preflight" };
+    }
     const ip = this.resolveIp(req);
 
     if (isWhitelisted(ip, this.whitelist)) {
