@@ -14,6 +14,12 @@ import { WebSocketServer } from 'ws';
 import { URL } from 'node:url';
 import { logger } from './logger.js';
 import { normalizeContractEvent } from './sse.js';
+import {
+  CLOSE_HANDSHAKE_TIMEOUT,
+  DEFAULT_HANDSHAKE_TIMEOUT_MS,
+  HandshakeState,
+  authenticateConnection,
+} from './websocket/auth.js';
 
 /** How often to ping each client to detect a half-open connection. */
 export const HEARTBEAT_INTERVAL_MS = 30_000;
