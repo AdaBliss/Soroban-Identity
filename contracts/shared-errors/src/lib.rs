@@ -70,6 +70,12 @@ pub enum IdentityRegistryError {
     FallbackChainExhausted = 27,
     /// The requested DID was not present in the resolver cache.
     CacheMiss = 28,
+    /// The caller is not authorized to perform the contract upgrade.
+    UpgradeUnauthorized = 29,
+    /// The supplied upgrade version is invalid (e.g. not newer than current).
+    InvalidUpgradeVersion = 30,
+    /// The requested DID has been deactivated.
+    DidDeactivated = 31,
 }
 
 /// Errors returned by the credential-manager contract.

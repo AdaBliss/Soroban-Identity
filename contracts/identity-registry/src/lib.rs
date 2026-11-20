@@ -66,6 +66,10 @@ pub enum ContractError {
     InvalidFallbackChain = 30,
     /// An existing IPFS CID cannot be changed or removed.
     CidImmutable = 31,
+    /// `upgrade`/`migrate` called by an address that is not the stored admin.
+    UpgradeUnauthorized = 32,
+    /// `upgrade` was given a version that is not strictly greater than the stored one.
+    InvalidUpgradeVersion = 33,
 }
 
 /// Version returned by `ping` for deployment health checks.
@@ -83,6 +87,8 @@ const PENDING_ADMIN: Symbol = symbol_short!("PADMIN");
 const DID_COUNT: Symbol = symbol_short!("DIDCNT");
 const TOTAL_DIDS: Symbol = symbol_short!("TOTDIDS");
 const PAUSED: Symbol = symbol_short!("PAUSED");
+/// Stored schema version, bumped by the admin-only `upgrade` entrypoint.
+const SCHEMA_VERSION: Symbol = symbol_short!("SCHEMAV");
 
 /// Byte prefix for on-chain DID strings (`did:stellar:<address>`).
 const DID_STELLAR_PREFIX: &[u8] = b"did:stellar:";
@@ -279,6 +285,71 @@ impl IdentityRegistry {
         }
         env.deployer().update_current_contract_wasm(new_wasm_hash);
         Ok(())
+    }
+
+    /// Admin-only contract upgrade / migration entrypoint (#1281 BE-17).
+    ///
+    /// Verifies the caller is the stored admin, rewrites every existing DID
+    /// record in place (preserving all fields and state), bumps the stored
+    /// schema version to `new_version`, and emits an `upgrade` event.
+    ///
+    /// `migration_data` is reserved for future schema migrations and is
+    /// currently only recorded in the emitted event.
+    ///
+    /// # Errors
+    /// Returns [`ContractError::NotInitialized`] if the contract has not been initialized.
+    /// Returns [`ContractError::UpgradeUnauthorized`] if `admin` is not the stored admin.
+    /// Returns [`ContractError::InvalidUpgradeVersion`] if `new_version` is not
+    /// strictly greater than the currently stored schema version.
+    pub fn migrate(
+        env: Env,
+        admin: Address,
+        new_version: u32,
+        migration_data: Bytes,
+    ) -> Result<(), ContractError> {
+        admin.require_auth();
+        let stored: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN)
+            .ok_or(ContractError::NotInitialized)?;
+        if stored != admin {
+            return Err(ContractError::UpgradeUnauthorized);
+        }
+
+        let current_version = Self::get_schema_version(env.clone());
+        if new_version <= current_version {
+            return Err(ContractError::InvalidUpgradeVersion);
+        }
+
+        // Rewrite every existing DID record without loss. Each record is read
+        // and written back unchanged so the migration is a no-op on the data
+        // itself while still exercising the storage path for future schemas.
+        let storage = env.storage().persistent();
+        let total: u32 = env.storage().instance().get(&TOTAL_DIDS).unwrap_or(0);
+        let mut migrated: u32 = 0;
+        let mut index: u32 = 0;
+        while index < total {
+            let key = (IDENTITY, index);
+            if let Some(doc) = storage.get::<_, DidDocument>(&key) {
+                storage.set(&key, &doc);
+                storage.extend_ttl(&key, TTL_BUMP_THRESHOLD, TTL_LEDGERS);
+                migrated += 1;
+            }
+            index += 1;
+        }
+
+        env.storage().instance().set(&SCHEMA_VERSION, &new_version);
+        env.events().publish(
+            (symbol_short!("upgrade"), symbol_short!("migrate")),
+            (EVENT_VERSION, admin, current_version, new_version, migrated, migration_data),
+        );
+        Ok(())
+    }
+
+    /// Returns the stored schema version (0 if the contract predates versioning).
+    pub fn get_schema_version(env: Env) -> u32 {
+        env.storage().instance().get(&SCHEMA_VERSION).unwrap_or(0)
     }
 
     /// Emergency stop: admin pauses all state-changing operations.
@@ -628,6 +699,22 @@ impl IdentityRegistry {
         Ok(doc)
     }
 
+    /// Guard used by attestation issuance/receipt paths: returns
+    /// [`ContractError::DidDeactivated`] if the DID exists but is inactive,
+    /// [`ContractError::DidNotFound`] if it does not exist at all.
+    pub fn require_active_did(env: Env, controller: Address) -> Result<(), ContractError> {
+        let key = Self::did_key(&env, &controller);
+        let doc: DidDocument = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::DidNotFound)?;
+        if !doc.active {
+            return Err(ContractError::DidDeactivated);
+        }
+        Ok(())
+    }
+
     // ── Universal DID resolver (#1127) ────────────────────────────────────────
 
     /// Registers a DID method with the universal resolver. Admin-only.
@@ -677,6 +764,15 @@ impl IdentityRegistry {
                 env.storage().persistent().extend_ttl(&key, TTL_BUMP_THRESHOLD, TTL_LEDGERS);
                 doc.active
             }
+            None => false,
+        }
+    }
+
+    /// Returns `true` if the DID exists but has been deactivated.
+    pub fn is_did_deactivated(env: Env, controller: Address) -> bool {
+        let key = Self::did_key(&env, &controller);
+        match env.storage().persistent().get::<_, DidDocument>(&key) {
+            Some(doc) => !doc.active,
             None => false,
         }
     }
@@ -1244,6 +1340,92 @@ mod tests {
         assert_eq!(
             client.try_upgrade(&attacker, &BytesN::from_array(&env, &[0u8; 32])),
             Err(Ok(ContractError::Unauthorized))
+        );
+    }
+
+    /// #1281 BE-17: admin-only migration bumps the schema version and preserves
+    /// existing DID state.
+    #[test]
+    fn test_migrate_preserves_did_state_and_bumps_version() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, IdentityRegistry);
+        let client = IdentityRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let user = Address::generate(&env);
+        client.create_did(&user, &Map::new(&env));
+        let before = client.resolve_did(&user);
+        assert_eq!(client.get_schema_version(), 0);
+
+        client.migrate(&admin, &2, &Bytes::new(&env));
+        assert_eq!(client.get_schema_version(), 2);
+
+        let after = client.resolve_did(&user);
+        assert_eq!(before, after);
+        assert!(client.has_active_did(&user));
+    }
+
+    /// #1281 BE-17: non-admin callers cannot migrate.
+    #[test]
+    fn test_migrate_unauthorized_returns_error() {
+        let (env, client) = setup();
+        let attacker = Address::generate(&env);
+        assert_eq!(
+            client.try_migrate(&attacker, &1, &Bytes::new(&env)),
+            Err(Ok(ContractError::UpgradeUnauthorized))
+        );
+    }
+
+    /// #1281 BE-17: the version must strictly increase.
+    #[test]
+    fn test_migrate_rejects_non_increasing_version() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, IdentityRegistry);
+        let client = IdentityRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        client.migrate(&admin, &3, &Bytes::new(&env));
+        assert_eq!(
+            client.try_migrate(&admin, &3, &Bytes::new(&env)),
+            Err(Ok(ContractError::InvalidUpgradeVersion))
+        );
+        assert_eq!(
+            client.try_migrate(&admin, &2, &Bytes::new(&env)),
+            Err(Ok(ContractError::InvalidUpgradeVersion))
+        );
+    }
+
+    /// #1283 BE-19: deactivated DIDs cannot issue or receive attestations.
+    #[test]
+    fn test_deactivated_did_cannot_issue_or_receive() {
+        let (env, client) = setup();
+        let issuer = Address::generate(&env);
+        let subject = Address::generate(&env);
+        client.create_did(&issuer, &Map::new(&env));
+        client.create_did(&subject, &Map::new(&env));
+
+        client.deactivate_did(&issuer);
+        assert!(client.is_did_deactivated(&issuer));
+        assert_eq!(
+            client.try_require_active_did(&issuer),
+            Err(Ok(ContractError::DidDeactivated))
+        );
+
+        client.deactivate_did(&subject);
+        assert_eq!(
+            client.try_require_active_did(&subject),
+            Err(Ok(ContractError::DidDeactivated))
+        );
+
+        // Unknown DIDs are reported as not found.
+        let unknown = Address::generate(&env);
+        assert_eq!(
+            client.try_require_active_did(&unknown),
+            Err(Ok(ContractError::DidNotFound))
         );
     }
 

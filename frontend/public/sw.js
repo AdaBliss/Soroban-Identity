@@ -8,10 +8,24 @@ const STATIC_CACHE = `${CACHE_PREFIX}static-${CACHE_VERSION}`;
 const API_CACHE = `${CACHE_PREFIX}api-${CACHE_VERSION}`;
 const CURRENT_CACHES = [STATIC_CACHE, API_CACHE];
 
-// App shell. Every entry must exist in the production build: cache.addAll()
-// is all-or-nothing, so a single 404 leaves the precache empty.
-const STATIC_ASSETS = ['/', '/index.html', '/manifest.json'];
+// App shell and static assets precached on install. addAll() is all-or-nothing,
+// so each asset is also cached individually as a fallback: a single 404 then
+// only skips that asset instead of leaving the precache empty.
+const STATIC_ASSETS = [
+  '/',
+  '/index.html',
+  '/manifest.json',
+  '/favicon.ico',
+  '/icon-96x96.png',
+  '/icon-192x192.png',
+  '/icon-512x512.png',
+  '/apple-touch-icon.png',
+];
 const APP_SHELL_URL = '/index.html';
+// Built JS/CSS bundles are discovered at install time from the app shell so
+// hashed filenames do not need to be hard-coded here.
+const PRECACHE_ASSET_PATTERN = /\.(?:js|css|woff2?|ttf|svg|png|jpg|jpeg|webp|ico)$/i;
+const PRECACHE_DISCOVERY_TIMEOUT_MS = 5000;
 
 // API responses (#1079): network first, falling back to the last good copy
 // when offline or when the network is slower than API_NETWORK_TIMEOUT_MS.
@@ -77,17 +91,62 @@ function isExpired(response, ttl) {
   return Date.now() - parseInt(cachedAt, 10) > ttl;
 }
 
-// Install event - cache static assets
+// Install event - precache the app shell and static assets
 self.addEventListener('install', (event) => {
-  event.waitUntil(
-    caches.open(STATIC_CACHE).then((cache) => {
-      return cache.addAll(STATIC_ASSETS).catch((error) => {
-        console.warn('Failed to cache some static assets:', error);
-      });
-    })
-  );
+  event.waitUntil(precacheStaticAssets());
   self.skipWaiting();
 });
+
+async function precacheStaticAssets() {
+  const cache = await caches.open(STATIC_CACHE);
+  const urls = new Set(STATIC_ASSETS);
+
+  // Discover built JS/CSS referenced by the app shell.
+  try {
+    const discovered = await discoverShellAssets();
+    discovered.forEach((url) => urls.add(url));
+  } catch (error) {
+    console.warn('Failed to discover app shell assets:', error);
+  }
+
+  const assetList = Array.from(urls);
+  try {
+    await cache.addAll(assetList);
+  } catch (error) {
+    console.warn('Bulk precache failed, caching assets individually:', error);
+    await Promise.all(
+      assetList.map((url) =>
+        cache.add(url).catch((assetError) => {
+          console.warn(`Failed to cache static asset ${url}:`, assetError);
+        })
+      )
+    );
+  }
+}
+
+// Fetch the app shell and extract same-origin script/stylesheet URLs.
+async function discoverShellAssets() {
+  const response = await withTimeout(fetch(APP_SHELL_URL, { cache: 'no-cache' }), PRECACHE_DISCOVERY_TIMEOUT_MS);
+  if (!response || response.status !== 200) return [];
+  const html = await response.text();
+  const urls = new Set();
+  const attributePattern = /(?:src|href)\s*=\s*["']([^"']+)["']/gi;
+  let match;
+  while ((match = attributePattern.exec(html)) !== null) {
+    const raw = match[1];
+    if (!raw || raw.startsWith('data:') || raw.startsWith('#')) continue;
+    let resolved;
+    try {
+      resolved = new URL(raw, self.location.origin);
+    } catch {
+      continue;
+    }
+    if (resolved.origin !== self.location.origin) continue;
+    if (!PRECACHE_ASSET_PATTERN.test(resolved.pathname)) continue;
+    urls.add(resolved.pathname + resolved.search);
+  }
+  return Array.from(urls);
+}
 
 // Activate event - remove this app's caches from older versions. Caches
 // with other names on the same origin are left alone.
@@ -239,6 +298,13 @@ async function handleNavigation(event) {
   }
 }
 
+// Offline fallback for uncached navigations: prefer the cached app shell so
+// the SPA can boot and render its own offline state.
+async function offlineNavigationResponse() {
+  const shell = (await caches.match(APP_SHELL_URL)) || (await caches.match('/'));
+  return shell || offlineTextResponse();
+}
+
 // Cache first strategy for static assets
 async function handleStaticRequest(event) {
   const cached = await caches.match(event.request);
@@ -251,6 +317,11 @@ async function handleStaticRequest(event) {
     }
     return response;
   } catch {
+    // Uncached static asset while offline: fall back to the app shell for
+    // navigations, otherwise return the plain offline response.
+    if (event.request.mode === 'navigate') {
+      return offlineNavigationResponse();
+    }
     return offlineTextResponse();
   }
 }

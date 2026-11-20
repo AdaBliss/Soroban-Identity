@@ -49,6 +49,8 @@ pub enum DidResolverError {
     MalformedDid,
     DidMethodAlreadyRegistered,
     NotFound,
+    /// The DID has been deactivated and can no longer be resolved.
+    DidDeactivated,
 }
 
 /// Storage keys for the DID resolver.
@@ -58,6 +60,8 @@ pub enum DidResolverKey {
     MethodRegistry(Symbol),
     /// Cached resolved documents keyed by DID string.
     ResolutionCache(String),
+    /// Deactivation flag keyed by DID string.
+    Deactivated(String),
     /// Admin authorized to register methods.
     Admin,
 }
@@ -158,8 +162,41 @@ impl DidResolver {
         Ok((method_sym, id_str))
     }
 
+    /// Check whether a DID has been deactivated.
+    pub fn is_deactivated(env: &Env, did: String) -> bool {
+        env.storage()
+            .persistent()
+            .has(&DidResolverKey::Deactivated(did))
+    }
+
+    /// Deactivate a DID. Admin-gated. Invalidates any cached resolution so
+    /// subsequent lookups observe the deactivated state.
+    pub fn deactivate_did(
+        env: &Env,
+        caller: Address,
+        did: String,
+    ) -> Result<(), DidResolverError> {
+        caller.require_auth();
+        let admin = Self::admin(env)?;
+        if caller != admin {
+            return Err(DidResolverError::NotFound);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DidResolverKey::Deactivated(did.clone()), &true);
+        // Invalidate the cache so the deactivated state is respected.
+        Self::clear_cache(env, did);
+        Ok(())
+    }
+
     /// Resolve a DID string into a DID document.
     pub fn resolve_did(env: &Env, did: String) -> Result<DidDocument, DidResolverError> {
+        // Deactivated DIDs can no longer be resolved.
+        if Self::is_deactivated(env, did.clone()) {
+            return Err(DidResolverError::DidDeactivated);
+        }
+
         // Check cache first.
         let cache_key = DidResolverKey::ResolutionCache(did.clone());
         if let Some(cached) = env
@@ -497,5 +534,31 @@ mod tests {
         DidResolver::clear_cache(&env, did.clone());
         let doc2 = DidResolver::resolve_did(&env, did.clone()).unwrap();
         assert_eq!(doc2.id, did);
+    }
+
+    #[test]
+    fn test_deactivated_did_cannot_resolve() {
+        let (env, admin) = setup();
+        let did = String::from_slice(&env, "did:web:example.com");
+        // Prime the cache.
+        let _ = DidResolver::resolve_did(&env, did.clone()).unwrap();
+        assert!(!DidResolver::is_deactivated(&env, did.clone()));
+
+        DidResolver::deactivate_did(&env, admin, did.clone()).unwrap();
+        assert!(DidResolver::is_deactivated(&env, did.clone()));
+
+        // Cache must be invalidated and resolution must fail.
+        let res = DidResolver::resolve_did(&env, did);
+        assert_eq!(res, Err(DidResolverError::DidDeactivated));
+    }
+
+    #[test]
+    fn test_deactivate_requires_admin() {
+        let (env, _admin) = setup();
+        let caller = Address::generate(&env);
+        let did = String::from_slice(&env, "did:web:example.com");
+        let res = DidResolver::deactivate_did(&env, caller, did.clone());
+        assert!(res.is_err());
+        assert!(!DidResolver::is_deactivated(&env, did));
     }
 }

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 interface ServiceWorkerState {
   isSupported: boolean;
@@ -116,6 +116,89 @@ export function useBackgroundSync() {
   }, []);
 
   return { isSyncing };
+}
+
+interface BeforeInstallPromptEvent extends Event {
+  prompt: () => Promise<void>;
+  userChoice: Promise<{ outcome: "accepted" | "dismissed"; platform: string }>;
+}
+
+interface InstallPromptState {
+  isInstallable: boolean;
+  isInstalled: boolean;
+}
+
+/**
+ * Hook to manage the PWA install prompt.
+ *
+ * Captures the deferred `beforeinstallprompt` event so the UI can trigger the
+ * native install flow on demand, and tracks whether the app is already running
+ * in standalone (installed) mode.
+ */
+export function useInstallPrompt() {
+  const [state, setState] = useState<InstallPromptState>(() => ({
+    isInstallable: false,
+    isInstalled:
+      typeof window !== "undefined" &&
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(display-mode: standalone)").matches,
+  }));
+  const deferredPromptRef = useRef<BeforeInstallPromptEvent | null>(null);
+
+  useEffect(() => {
+    const handleBeforeInstallPrompt = (event: Event) => {
+      // Prevent the mini-infobar from appearing on mobile so we can show our
+      // own install UI instead.
+      event.preventDefault();
+      deferredPromptRef.current = event as BeforeInstallPromptEvent;
+      setState((prev) => ({ ...prev, isInstallable: true }));
+    };
+
+    const handleAppInstalled = () => {
+      deferredPromptRef.current = null;
+      setState({ isInstallable: false, isInstalled: true });
+    };
+
+    const mediaQuery =
+      typeof window.matchMedia === "function"
+        ? window.matchMedia("(display-mode: standalone)")
+        : null;
+    const handleDisplayModeChange = (event: MediaQueryListEvent) => {
+      setState((prev) => ({ ...prev, isInstalled: event.matches }));
+    };
+
+    window.addEventListener("beforeinstallprompt", handleBeforeInstallPrompt);
+    window.addEventListener("appinstalled", handleAppInstalled);
+    mediaQuery?.addEventListener("change", handleDisplayModeChange);
+
+    return () => {
+      window.removeEventListener(
+        "beforeinstallprompt",
+        handleBeforeInstallPrompt
+      );
+      window.removeEventListener("appinstalled", handleAppInstalled);
+      mediaQuery?.removeEventListener("change", handleDisplayModeChange);
+    };
+  }, []);
+
+  const promptInstall = async (): Promise<"accepted" | "dismissed" | null> => {
+    const deferredPrompt = deferredPromptRef.current;
+    if (!deferredPrompt) return null;
+
+    try {
+      await deferredPrompt.prompt();
+      const { outcome } = await deferredPrompt.userChoice;
+      // The prompt can only be used once.
+      deferredPromptRef.current = null;
+      setState((prev) => ({ ...prev, isInstallable: false }));
+      return outcome;
+    } catch (error) {
+      console.error("Install prompt failed:", error);
+      return null;
+    }
+  };
+
+  return { ...state, promptInstall };
 }
 
 /** Must match API_CACHE in public/sw.js. */
