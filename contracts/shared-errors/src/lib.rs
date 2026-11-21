@@ -157,14 +157,20 @@ pub enum CredentialManagerError {
     PresentationExpired = 35,
     /// The presentation proof format is not supported.
     UnsupportedProofFormat = 36,
+    /// The requested role was not found.
+    RoleNotFound = 37,
+    /// The caller's role does not grant the required capability.
+    InsufficientRole = 38,
+    /// The role has already been granted to the account.
+    RoleAlreadyGranted = 39,
     /// The supplied metadata hash is empty or otherwise invalid.
-    InvalidMetadataHash = 37,
+    InvalidMetadataHash = 40,
     /// The supplied claim type is empty.
-    EmptyClaimType = 38,
+    EmptyClaimType = 41,
     /// The supplied claim value is empty.
-    EmptyClaimValue = 39,
+    EmptyClaimValue = 42,
     /// The supplied attestation expiry is invalid (e.g. in the past).
-    InvalidExpiry = 40,
+    InvalidExpiry = 43,
     /// The caller is not a trusted issuer for the requested claim type.
-    NotTrustedIssuer = 41,
+    NotTrustedIssuer = 44,
 }

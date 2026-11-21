@@ -176,6 +176,55 @@ const ORACLE_FEE: Symbol = symbol_short!("ORACLFEE");
 /// Sequence number for generating unique oracle request IDs.
 const ORACLE_SEQ: Symbol = symbol_short!("ORACLSEQ");
 
+// ── Issue #1270: role-based access control ───────────────────────────────────
+/// Maps an address to its [`RoleAssignment`].
+const ROLE_ASSIGN: Symbol = symbol_short!("ROLEASGN");
+/// Reverse index: maps a [`Role`] to the addresses currently holding it.
+const ROLE_MEMBERS: Symbol = symbol_short!("ROLEMBR");
+
+/// Contract-level roles. `Owner` is the administrative superuser, `Issuer`
+/// may issue and revoke credentials, and `User` may read and self-service.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    Owner = 0,
+    Issuer = 1,
+    User = 2,
+}
+
+/// Fine-grained capabilities checked by [`CredentialManager::has_capability`].
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Capability {
+    /// Manage contract configuration, upgrades, and roles.
+    Admin = 0,
+    /// Issue and revoke credentials.
+    Issue = 1,
+    /// Read credentials and perform self-service operations.
+    Read = 2,
+}
+
+/// Persisted role grant for a single address (#1270).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RoleAssignment {
+    pub account: Address,
+    pub role: Role,
+    pub granted_by: Address,
+    pub granted_at: u64,
+}
+
+impl Role {
+    /// The capability this role confers.
+    pub fn capability(self) -> Capability {
+        match self {
+            Role::Owner => Capability::Admin,
+            Role::Issuer => Capability::Issue,
+            Role::User => Capability::Read,
+        }
+    }
+}
+
 #[contracterror]
 #[derive(Clone, Debug, PartialEq, Copy)]
 pub enum ContractError {
@@ -665,6 +714,8 @@ impl CredentialManager {
     ) -> Result<(), ContractError> {
         Self::require_uninitialized(&env)?;
         Self::set_admin(&env, &admin);
+        // #1270: the initial admin is the contract Owner.
+        Self::assign_role_internal(&env, &admin, Role::Owner, &admin);
         env.storage()
             .instance()
             .set(&IDENTITY_REGISTRY, &identity_registry_id);
@@ -678,7 +729,7 @@ impl CredentialManager {
         current_admin: Address,
         new_admin: Address,
     ) -> Result<(), ContractError> {
-        current_admin.require_auth();
+        Self::require_role(&env, &current_admin, Role::Owner)?;
         let stored: Address = env
             .storage()
             .instance()
@@ -688,11 +739,69 @@ impl CredentialManager {
             return Err(ContractError::Unauthorized);
         }
         env.storage().instance().set(&ADMIN, &new_admin);
+        // #1270: move the Owner role along with the admin address.
+        Self::remove_role_internal(&env, &current_admin, Role::Owner);
+        Self::assign_role_internal(&env, &new_admin, Role::Owner, &current_admin);
         env.events().publish(
             (ADMIN, symbol_short!("transfer")),
             (EVENT_VERSION, current_admin, new_admin),
         );
         Ok(())
+    }
+
+    // ── Role-based access control (#1270) ───────────────────────────────────
+
+    /// Grants `role` to `account`. Owner-only.
+    pub fn grant_role(
+        env: Env,
+        caller: Address,
+        account: Address,
+        role: Role,
+    ) -> Result<(), ContractError> {
+        Self::require_role(&env, &caller, Role::Owner)?;
+        Self::assign_role_internal(&env, &account, role, &caller);
+        Ok(())
+    }
+
+    /// Revokes `role` from `account`. Owner-only. The Owner role cannot be
+    /// revoked through this entry point; use [`Self::transfer_admin`].
+    pub fn revoke_role(
+        env: Env,
+        caller: Address,
+        account: Address,
+        role: Role,
+    ) -> Result<(), ContractError> {
+        Self::require_role(&env, &caller, Role::Owner)?;
+        if role == Role::Owner {
+            return Err(ContractError::Unauthorized);
+        }
+        Self::remove_role_internal(&env, &account, role);
+        Ok(())
+    }
+
+    /// Returns the role assignment for `account`, if any.
+    pub fn get_role(env: Env, account: Address) -> Option<RoleAssignment> {
+        env.storage()
+            .persistent()
+            .get(&(ROLE_ASSIGN, account))
+    }
+
+    /// Returns `true` when `account` holds `role`.
+    pub fn has_role(env: Env, account: Address, role: Role) -> bool {
+        Self::role_holds(&env, &account, role)
+    }
+
+    /// Returns `true` when `account` holds a role conferring `capability`.
+    pub fn has_capability(env: Env, account: Address, capability: Capability) -> bool {
+        Self::capability_holds(&env, &account, capability)
+    }
+
+    /// Lists every account currently holding `role`.
+    pub fn get_role_members(env: Env, role: Role) -> Vec<Address> {
+        env.storage()
+            .persistent()
+            .get(&(ROLE_MEMBERS, role))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     pub fn upgrade(
@@ -701,7 +810,7 @@ impl CredentialManager {
         new_wasm_hash: BytesN<32>,
         timelock_duration: Option<u32>,
     ) -> Result<(), ContractError> {
-        admin.require_auth();
+        Self::require_role(&env, &admin, Role::Owner)?;
         let stored: Address = env
             .storage()
             .instance()
@@ -728,7 +837,7 @@ impl CredentialManager {
     /// Issue #663: Execute a proposed upgrade after timelock expires.
     /// Only the admin can execute upgrades. The timelock must have expired.
     pub fn execute_upgrade(env: Env, admin: Address) -> Result<(), ContractError> {
-        admin.require_auth();
+        Self::require_role(&env, &admin, Role::Owner)?;
         let stored: Address = env
             .storage()
             .instance()
@@ -764,7 +873,7 @@ impl CredentialManager {
     /// Issue #663: Cancel a pending upgrade proposal.
     /// Only the admin can cancel upgrades.
     pub fn cancel_upgrade(env: Env, admin: Address) -> Result<(), ContractError> {
-        admin.require_auth();
+        Self::require_role(&env, &admin, Role::Owner)?;
         let stored: Address = env
             .storage()
             .instance()
@@ -794,6 +903,7 @@ impl CredentialManager {
 
     pub fn pause(env: Env) -> Result<(), ContractError> {
         Self::require_admin(&env)?;
+        Self::require_capability(&env, &Self::admin_address(&env)?, Capability::Admin)?;
         // The pause flag lives in the packed config (#661), which is what
         // `require_not_paused` reads.
         let mut config = Self::get_config(&env);
@@ -808,6 +918,7 @@ impl CredentialManager {
 
     pub fn unpause(env: Env) -> Result<(), ContractError> {
         Self::require_admin(&env)?;
+        Self::require_capability(&env, &Self::admin_address(&env)?, Capability::Admin)?;
         let mut config = Self::get_config(&env);
         config.is_paused = false;
         Self::set_config(&env, &config);
@@ -824,6 +935,7 @@ impl CredentialManager {
 
     pub fn add_issuer(env: Env, issuer: Address) -> Result<(), ContractError> {
         Self::require_admin(&env)?;
+        Self::require_capability(&env, &Self::admin_address(&env)?, Capability::Admin)?;
         let mut issuers = Self::get_issuers_internal(&env);
         if !issuers.contains(&issuer) {
             if issuers.len() >= Self::effective_max_issuers(&env) {
@@ -831,6 +943,8 @@ impl CredentialManager {
             }
             issuers.push_back(issuer.clone());
             env.storage().instance().set(&ISSUER, &issuers);
+            // #1270: an issuer is also granted the Issuer role.
+            Self::assign_role_internal(&env, &issuer, Role::Issuer, &Self::admin_address(&env)?);
             env.events()
                 .publish((ISSUER, symbol_short!("added")), (EVENT_VERSION, issuer));
         }
@@ -838,7 +952,7 @@ impl CredentialManager {
     }
 
     pub fn set_max_issuers(env: Env, admin: Address, new_max: u32) -> Result<(), ContractError> {
-        admin.require_auth();
+        Self::require_role(&env, &admin, Role::Owner)?;
         let stored: Address = env
             .storage()
             .instance()
@@ -867,6 +981,7 @@ impl CredentialManager {
 
     pub fn remove_issuer(env: Env, issuer: Address) -> Result<(), ContractError> {
         Self::require_admin(&env)?;
+        Self::require_capability(&env, &Self::admin_address(&env)?, Capability::Admin)?;
         let issuers = Self::get_issuers_internal(&env);
         let mut updated = Vec::new(&env);
         for i in issuers.iter() {
@@ -875,6 +990,8 @@ impl CredentialManager {
             }
         }
         env.storage().instance().set(&ISSUER, &updated);
+        // #1270: removing an issuer also revokes its Issuer role.
+        Self::remove_role_internal(&env, &issuer, Role::Issuer);
         Ok(())
     }
 
@@ -883,7 +1000,7 @@ impl CredentialManager {
         issuer: Address,
         schema_hash: BytesN<32>,
     ) -> Result<(), ContractError> {
-        issuer.require_auth();
+        Self::require_role(&env, &issuer, Role::Issuer)?;
         Self::require_not_paused(&env)?;
         Self::require_issuer(&env, &issuer)?;
         if schema_hash == BytesN::from_array(&env, &[0u8; 32]) {
@@ -919,6 +1036,7 @@ impl CredentialManager {
         metadata: Map<String, String>,
     ) -> Result<(), ContractError> {
         Self::require_admin_caller(&env, &admin)?;
+        Self::require_capability(&env, &admin, Capability::Admin)?;
         if schema_hash == BytesN::from_array(&env, &[0u8; 32]) {
             return Err(ContractError::InvalidSchemaHash);
         }
@@ -965,6 +1083,7 @@ impl CredentialManager {
         type_name: String,
     ) -> Result<(), ContractError> {
         Self::require_admin_caller(&env, &admin)?;
+        Self::require_capability(&env, &admin, Capability::Admin)?;
         let key = Self::type_key(&type_name);
         let mut descriptor: CredentialTypeDescriptor = env
             .storage()
@@ -1009,6 +1128,7 @@ impl CredentialManager {
         verification_key: Bytes,
     ) -> Result<(), ContractError> {
         Self::require_admin_caller(&env, &admin)?;
+        Self::require_capability(&env, &admin, Capability::Admin)?;
         if proof_type != ZK_PROOF_RANGE && proof_type != ZK_PROOF_MEMBERSHIP {
             return Err(ContractError::UnsupportedZkProofType);
         }
@@ -1051,6 +1171,7 @@ impl CredentialManager {
         active: bool,
     ) -> Result<(), ContractError> {
         Self::require_admin_caller(&env, &admin)?;
+        Self::require_capability(&env, &admin, Capability::Admin)?;
         let key = (ZK_SCHEMA, schema_id);
         let mut schema: ZkProofSchema = env
             .storage()
@@ -1155,7 +1276,7 @@ impl CredentialManager {
         schema_hash: Option<BytesN<32>>,
         proof: Option<Bytes>,
     ) -> Result<BytesN<32>, ContractError> {
-        issuer.require_auth();
+        Self::require_role(&env, &issuer, Role::Issuer)?;
         Self::require_not_paused(&env)?;
         Self::require_issuer(&env, &issuer)?;
         // Activation time-locking is intentionally isolated to issue #813.

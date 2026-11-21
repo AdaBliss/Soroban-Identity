@@ -17,6 +17,8 @@ pub struct Attestation {
     pub issued_at_ledger: u32,
     pub expires_at_ledger: u32,
     pub revoked: bool,
+    pub revoked_at_ledger: u32,
+    pub revoked_by: Option<Address>,
 }
 
 fn storage_key(id: &BytesN<32>) -> (Symbol, BytesN<32>) {
@@ -100,15 +102,21 @@ pub fn verify_attestation(env: &Env, id: &BytesN<32>) -> bool {
     }
 }
 
-pub fn revoke_attestation(env: &Env, issuer: &Address, id: &BytesN<32>) -> bool {
+pub fn revoke_attestation(env: &Env, caller: &Address, id: &BytesN<32>) -> bool {
+    caller.require_auth();
     let mut attestation = match get(env, id) {
         Some(value) => value,
         None => return false,
     };
-    if attestation.issuer != issuer.clone() {
+    if attestation.issuer != caller.clone() {
+        return false;
+    }
+    if attestation.revoked {
         return false;
     }
     attestation.revoked = true;
+    attestation.revoked_at_ledger = env.ledger().sequence();
+    attestation.revoked_by = Some(caller.clone());
     store(env, &attestation);
     env.events()
         .publish((ATTESTATION, ATTESTATION_REVOKED), id.clone());
@@ -134,6 +142,8 @@ pub fn issue_attestation(
         issued_at_ledger: env.ledger().sequence(),
         expires_at_ledger,
         revoked: false,
+        revoked_at_ledger: 0,
+        revoked_by: None,
     };
     store(env, &attestation);
     env.events()
@@ -282,6 +292,32 @@ mod tests {
         let other = Address::generate(&env);
         assert!(!revoke_attestation(&env, &other, &id));
         assert!(verify_attestation(&env, &id));
+    }
+
+    #[test]
+    fn successful_revocation_records_metadata() {
+        let (env, issuer, subject, id) = setup();
+        assert!(issue_attestation(&env, &issuer, id.clone(), subject, claims(&env), 150));
+        env.ledger().with_mut(|li| li.sequence_number = 120);
+        assert!(revoke_attestation(&env, &issuer, &id));
+        let stored = get(&env, &id).unwrap();
+        assert!(stored.revoked);
+        assert_eq!(stored.revoked_at_ledger, 120);
+        assert_eq!(stored.revoked_by, Some(issuer));
+    }
+
+    #[test]
+    fn double_revocation_is_rejected() {
+        let (env, issuer, subject, id) = setup();
+        assert!(issue_attestation(&env, &issuer, id.clone(), subject, claims(&env), 150));
+        assert!(revoke_attestation(&env, &issuer, &id));
+        assert!(!revoke_attestation(&env, &issuer, &id));
+    }
+
+    #[test]
+    fn revoking_a_missing_attestation_fails() {
+        let (env, issuer, _subject, id) = setup();
+        assert!(!revoke_attestation(&env, &issuer, &id));
     }
 
     #[test]
