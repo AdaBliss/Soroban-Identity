@@ -70,6 +70,8 @@ pub enum IdentityRegistryError {
     FallbackChainExhausted = 27,
     /// The requested DID was not present in the resolver cache.
     CacheMiss = 28,
+    /// The supplied metadata hash is empty or otherwise invalid.
+    InvalidMetadataHash = 29,
 }
 
 /// Errors returned by the credential-manager contract.
@@ -155,4 +157,14 @@ pub enum CredentialManagerError {
     InsufficientRole = 38,
     /// The role has already been granted to the account.
     RoleAlreadyGranted = 39,
+    /// The supplied metadata hash is empty or otherwise invalid.
+    InvalidMetadataHash = 40,
+    /// The supplied claim type is empty.
+    EmptyClaimType = 41,
+    /// The supplied claim value is empty.
+    EmptyClaimValue = 42,
+    /// The supplied attestation expiry is invalid (e.g. in the past).
+    InvalidExpiry = 43,
+    /// The caller is not a trusted issuer for the requested claim type.
+    NotTrustedIssuer = 44,
 }

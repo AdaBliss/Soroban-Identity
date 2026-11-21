@@ -22,12 +22,12 @@ import { HorizonIndexer } from './indexer.js';
 // Load secrets before validation so existing config consumers see the same
 // values as environment-backed deployments. Vault is opt-in and fails closed
 // when explicitly configured rather than silently falling back to plaintext.
-const vaultManager = new VaultLeaseManager();
-if (vaultManager.enabled) {
+const secretsManager = new VaultLeaseManager();
+if (secretsManager.enabled) {
   try {
-    await vaultManager.refresh();
+    await secretsManager.refresh();
   } catch (error) {
-    logger.error({ error: error.message }, 'Vault initialization failed');
+    logger.error({ error: error.message }, 'Secret vault initialization failed');
     process.exit(1);
   }
 }
@@ -52,8 +52,8 @@ if (!validationResult.isValid) {
 logDefaultValues();
 
 const config = loadConfig();
-if (vaultManager.enabled) {
-  vaultManager.onSecrets = async () => {
+if (secretsManager.enabled) {
+  secretsManager.onSecrets = async () => {
     Object.assign(config, loadConfig());
     logger.info('Vault secrets applied to live configuration');
   };
@@ -171,10 +171,17 @@ if (config.accessLogEnabled && config.accessLogPath) {
   });
 }
 
+let dbPool = null;
+if (config.databaseUrl) {
+  const { default: pg } = await import('pg');
+  dbPool = new pg.Pool({ connectionString: config.databaseUrl, max: 2 });
+}
+
 const server = http.createServer(
   createApp({
     config,
     soroban,
+    dbClient: dbPool,
     metrics,
     metricsAggregator,
     didCache,
@@ -257,7 +264,7 @@ function shutdown(signal) {
       }
 
       // Stop vault manager
-      vaultManager.stop();
+      secretsManager.stop();
 
       // Close WebSocket hub
       if (realtime) {
@@ -271,6 +278,11 @@ function shutdown(signal) {
 
       logger.info('Draining Soroban client');
       await soroban.drain();
+
+      if (dbPool) {
+        logger.info('Closing database pool');
+        await dbPool.end();
+      }
 
       // Close access log sink
       if (accessLogSink) {
