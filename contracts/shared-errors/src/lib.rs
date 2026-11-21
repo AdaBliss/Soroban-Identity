@@ -72,6 +72,12 @@ pub enum IdentityRegistryError {
     CacheMiss = 28,
     /// The supplied metadata hash is empty or otherwise invalid.
     InvalidMetadataHash = 29,
+    /// The caller is not authorized to perform the contract upgrade.
+    UpgradeUnauthorized = 30,
+    /// The supplied upgrade version is invalid (e.g. not newer than current).
+    InvalidUpgradeVersion = 31,
+    /// The requested DID has been deactivated.
+    DidDeactivated = 32,
 }
 
 /// Errors returned by the credential-manager contract.
