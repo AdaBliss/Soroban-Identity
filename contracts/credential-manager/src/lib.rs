@@ -31,7 +31,7 @@ pub use presentation::{
 };
 
 mod attestation;
-pub use attestation::Attestation;
+pub use attestation::{Attestation, AttestationRecord};
 
 mod oracle;
 pub use oracle::{
@@ -4738,6 +4738,43 @@ mod tests {
         let contract_id = env.register_contract(None, CredentialManager);
         let client = CredentialManagerClient::new(&env, &contract_id);
         assert_eq!(client.ping(), CONTRACT_VERSION);
+    }
+
+    #[test]
+    fn test_issue_attestation_by_trusted_issuer() {
+        let (env, _admin, client) = setup();
+        let issuer = Address::generate(&env);
+        let subject = Address::generate(&env);
+        client.add_issuer(&issuer);
+
+        let expiry = env.ledger().timestamp() + 1_000;
+        let claim_type = String::from_str(&env, "kyc_level");
+        let value = String::from_str(&env, "gold");
+        let attestation_id =
+            client.issue_attestation(&issuer, &subject, &claim_type, &value, &expiry);
+
+        let record = client.get_attestation(&attestation_id);
+        assert_eq!(record.id, attestation_id);
+        assert_eq!(record.issuer, issuer);
+        assert_eq!(record.subject, subject);
+        assert_eq!(record.claim_type, claim_type);
+        assert_eq!(record.value, value);
+        assert_eq!(record.expiry, expiry);
+    }
+
+    #[test]
+    fn test_issue_attestation_rejects_untrusted_issuer() {
+        let (env, _admin, client) = setup();
+        let attacker = Address::generate(&env);
+        let subject = Address::generate(&env);
+
+        let expiry = env.ledger().timestamp() + 1_000;
+        let claim_type = String::from_str(&env, "kyc_level");
+        let value = String::from_str(&env, "gold");
+        assert_eq!(
+            client.try_issue_attestation(&attacker, &subject, &claim_type, &value, &expiry),
+            Err(Ok(ContractError::UnauthorizedIssuer))
+        );
     }
 
     #[test]

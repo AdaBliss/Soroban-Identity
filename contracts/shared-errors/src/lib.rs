@@ -70,12 +70,14 @@ pub enum IdentityRegistryError {
     FallbackChainExhausted = 27,
     /// The requested DID was not present in the resolver cache.
     CacheMiss = 28,
+    /// The supplied metadata hash is empty or otherwise invalid.
+    InvalidMetadataHash = 29,
     /// The caller is not authorized to perform the contract upgrade.
-    UpgradeUnauthorized = 29,
+    UpgradeUnauthorized = 30,
     /// The supplied upgrade version is invalid (e.g. not newer than current).
-    InvalidUpgradeVersion = 30,
+    InvalidUpgradeVersion = 31,
     /// The requested DID has been deactivated.
-    DidDeactivated = 31,
+    DidDeactivated = 32,
 }
 
 /// Errors returned by the credential-manager contract.
@@ -155,4 +157,14 @@ pub enum CredentialManagerError {
     PresentationExpired = 35,
     /// The presentation proof format is not supported.
     UnsupportedProofFormat = 36,
+    /// The supplied metadata hash is empty or otherwise invalid.
+    InvalidMetadataHash = 37,
+    /// The supplied claim type is empty.
+    EmptyClaimType = 38,
+    /// The supplied claim value is empty.
+    EmptyClaimValue = 39,
+    /// The supplied attestation expiry is invalid (e.g. in the past).
+    InvalidExpiry = 40,
+    /// The caller is not a trusted issuer for the requested claim type.
+    NotTrustedIssuer = 41,
 }

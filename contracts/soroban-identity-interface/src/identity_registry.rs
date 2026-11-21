@@ -35,6 +35,30 @@ pub trait IdentityRegistryInterface {
         metadata: Map<String, String>,
     ) -> Result<String, ContractError>;
 
+    /// Register a new DID owned by `owner` and store the initial metadata hash.
+    ///
+    /// Returns the canonical DID string for the newly created identity.
+    fn create_identity(
+        env: Env,
+        owner: Address,
+        did: String,
+        metadata_hash: BytesN<32>,
+    ) -> Result<String, ContractError>;
+
+    /// Update the metadata hash of an existing DID owned by `owner`.
+    fn update_identity(
+        env: Env,
+        owner: Address,
+        did: String,
+        metadata_hash: BytesN<32>,
+    ) -> Result<(), ContractError>;
+
+    /// Resolve a DID string to its full DID document.
+    ///
+    /// Returns `Err(ContractError::DidNotFound)` (rather than panicking) when
+    /// the DID is unknown.
+    fn resolve_identity(env: Env, did: String) -> Result<DidDocument, ContractError>;
+
     fn create_dids_batch(
         env: Env,
         entries: Vec<(Address, Map<String, String>)>,
@@ -176,6 +200,28 @@ impl IdentityRegistryInterface for IdentityRegistry {
         metadata: Map<String, String>,
     ) -> Result<String, ContractError> {
         Self::create_did(env, controller, metadata)
+    }
+
+    fn create_identity(
+        env: Env,
+        owner: Address,
+        did: String,
+        metadata_hash: BytesN<32>,
+    ) -> Result<String, ContractError> {
+        Self::create_identity(env, owner, did, metadata_hash)
+    }
+
+    fn update_identity(
+        env: Env,
+        owner: Address,
+        did: String,
+        metadata_hash: BytesN<32>,
+    ) -> Result<(), ContractError> {
+        Self::update_identity(env, owner, did, metadata_hash)
+    }
+
+    fn resolve_identity(env: Env, did: String) -> Result<DidDocument, ContractError> {
+        Self::resolve_identity(env, did)
     }
 
     fn create_dids_batch(
