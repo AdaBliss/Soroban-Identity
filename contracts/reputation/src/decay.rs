@@ -104,7 +104,7 @@ pub fn calculate(score: i64, elapsed_secs: u64, params: &DecayParameters) -> i64
         DecayAlgorithm::Linear => {
             let periods = (elapsed_secs / params.period_secs).min(MAX_PERIODS) as i128;
             let removed = (params.rate_bps as i128 * periods).min(MAX_RATE_BPS as i128);
-            raw - raw * removed / MAX_RATE_BPS as i128
+            raw - raw.saturating_mul(removed) / MAX_RATE_BPS as i128
         }
         DecayAlgorithm::Exponential => {
             let half_lives = (elapsed_secs / params.half_life_secs).min(MAX_PERIODS);
@@ -122,7 +122,7 @@ pub fn calculate(score: i64, elapsed_secs: u64, params: &DecayParameters) -> i64
             let retain = MAX_RATE_BPS as i128 - params.rate_bps as i128;
             let mut value = raw;
             for _ in 0..steps {
-                value = value * retain / MAX_RATE_BPS as i128;
+                value = value.saturating_mul(retain) / MAX_RATE_BPS as i128;
                 if value == 0 {
                     break;
                 }
@@ -171,5 +171,43 @@ mod tests {
     #[test]
     fn none_is_identity() {
         assert_eq!(calculate(123, u64::MAX, &DecayParameters::none()), 123);
+    }
+
+    #[test]
+    fn extreme_elapsed_and_score_do_not_overflow() {
+        let max_score = i64::MAX;
+        assert_eq!(
+            calculate(max_score, u64::MAX, &DecayParameters::linear(1, 1)),
+            0
+        );
+        assert_eq!(
+            calculate(max_score, u64::MAX, &DecayParameters::linear(10_000, 1)),
+            0
+        );
+        assert_eq!(
+            calculate(max_score, u64::MAX, &DecayParameters::exponential(1)),
+            0
+        );
+        assert_eq!(
+            calculate(max_score, u64::MAX, &DecayParameters::step(1, 1)),
+            0
+        );
+        assert_eq!(
+            calculate(max_score, u64::MAX, &DecayParameters::step(10_000, 1)),
+            0
+        );
+        assert_eq!(
+            calculate(max_score, u64::MAX, &DecayParameters::none()),
+            max_score
+        );
+    }
+
+    #[test]
+    fn extreme_elapsed_with_small_rate_stays_in_range() {
+        let max_score = i64::MAX;
+        let result = calculate(max_score, u64::MAX, &DecayParameters::linear(1, u64::MAX));
+        assert_eq!(result, max_score);
+        let result = calculate(max_score, u64::MAX, &DecayParameters::step(1, u64::MAX));
+        assert_eq!(result, max_score);
     }
 }

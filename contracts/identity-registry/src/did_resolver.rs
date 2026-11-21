@@ -41,6 +41,18 @@ pub struct DidDocument {
     pub services: Vec<Service>,
 }
 
+/// A versioned snapshot of a DID document.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DidDocumentVersion {
+    /// Monotonically increasing version number, starting at 1.
+    pub version: u32,
+    /// Ledger timestamp at which this version was recorded.
+    pub updated_at: u64,
+    /// The document contents at this version.
+    pub document: DidDocument,
+}
+
 /// Errors produced by the DID resolver.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -58,6 +70,10 @@ pub enum DidResolverKey {
     MethodRegistry(Symbol),
     /// Cached resolved documents keyed by DID string.
     ResolutionCache(String),
+    /// Latest recorded version metadata keyed by DID string.
+    LatestVersion(String),
+    /// Historical versions keyed by (DID string, version number).
+    History(String, u32),
     /// Admin authorized to register methods.
     Admin,
     /// Stored identity documents keyed by DID string.
@@ -380,6 +396,79 @@ impl DidResolver {
             .remove(&DidResolverKey::ResolutionCache(did));
     }
 
+    /// Record a new version of a DID document, returning the stored version.
+    ///
+    /// The version number is derived from the previously recorded latest
+    /// version (starting at 1) and `updated_at` is taken from the ledger.
+    pub fn record_version(
+        env: &Env,
+        did: String,
+        document: DidDocument,
+    ) -> Result<DidDocumentVersion, DidResolverError> {
+        let latest_key = DidResolverKey::LatestVersion(did.clone());
+        let previous: Option<DidDocumentVersion> = env.storage().persistent().get(&latest_key);
+        let next_version = match previous {
+            Some(prev) => prev.version + 1,
+            None => 1,
+        };
+
+        let version = DidDocumentVersion {
+            version: next_version,
+            updated_at: env.ledger().timestamp(),
+            document,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DidResolverKey::History(did.clone(), next_version), &version);
+        env.storage().persistent().set(&latest_key, &version);
+
+        Ok(version)
+    }
+
+    /// Fetch the latest recorded version metadata for a DID, if any.
+    pub fn latest_version(
+        env: &Env,
+        did: String,
+    ) -> Result<DidDocumentVersion, DidResolverError> {
+        env.storage()
+            .persistent()
+            .get(&DidResolverKey::LatestVersion(did))
+            .ok_or(DidResolverError::NotFound)
+    }
+
+    /// Fetch a specific historical revision of a DID document.
+    pub fn get_version(
+        env: &Env,
+        did: String,
+        version: u32,
+    ) -> Result<DidDocumentVersion, DidResolverError> {
+        env.storage()
+            .persistent()
+            .get(&DidResolverKey::History(did, version))
+            .ok_or(DidResolverError::NotFound)
+    }
+
+    /// Fetch all recorded revisions of a DID document, oldest first.
+    pub fn get_history(
+        env: &Env,
+        did: String,
+    ) -> Result<Vec<DidDocumentVersion>, DidResolverError> {
+        let latest = Self::latest_version(env, did.clone())?;
+        let mut history: Vec<DidDocumentVersion> = Vec::new(env);
+        let mut v: u32 = 1;
+        while v <= latest.version {
+            let entry: DidDocumentVersion = env
+                .storage()
+                .persistent()
+                .get(&DidResolverKey::History(did.clone(), v))
+                .ok_or(DidResolverError::NotFound)?;
+            history.push_back(entry);
+            v += 1;
+        }
+        Ok(history)
+    }
+
     /// Persist an identity record for a DID string.
     pub fn store_identity(
         env: &Env,
@@ -591,6 +680,39 @@ mod tests {
         DidResolver::clear_cache(&env, did.clone());
         let doc2 = DidResolver::resolve_did(&env, did.clone()).unwrap();
         assert_eq!(doc2.id, did);
+    }
+
+    #[test]
+    fn test_record_and_get_history() {
+        let (env, _admin) = setup();
+        let did = String::from_slice(&env, "did:web:example.com");
+        let doc = DidResolver::resolve_did(&env, did.clone()).unwrap();
+
+        let v1 = DidResolver::record_version(&env, did.clone(), doc.clone()).unwrap();
+        assert_eq!(v1.version, 1);
+        let v2 = DidResolver::record_version(&env, did.clone(), doc.clone()).unwrap();
+        assert_eq!(v2.version, 2);
+
+        let latest = DidResolver::latest_version(&env, did.clone()).unwrap();
+        assert_eq!(latest.version, 2);
+
+        let history = DidResolver::get_history(&env, did.clone()).unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history.get(0).unwrap().version, 1);
+        assert_eq!(history.get(1).unwrap().version, 2);
+
+        let fetched = DidResolver::get_version(&env, did.clone(), 1).unwrap();
+        assert_eq!(fetched.document.id, did);
+    }
+
+    #[test]
+    fn test_history_not_found() {
+        let (env, _admin) = setup();
+        let did = String::from_slice(&env, "did:web:example.com");
+        let res = DidResolver::get_history(&env, did.clone());
+        assert_eq!(res, Err(DidResolverError::NotFound));
+        let res2 = DidResolver::get_version(&env, did, 1);
+        assert_eq!(res2, Err(DidResolverError::NotFound));
     }
 
     fn sample_record(env: &Env, did: &String) -> IdentityRecord {
