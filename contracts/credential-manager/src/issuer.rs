@@ -2,6 +2,9 @@ use soroban_sdk::{symbol_short, Address, Env, Vec};
 use crate::keys::{ADMIN, ISSUER};
 use crate::threshold::{SignedPayload, SignerSet};
 
+/// Maximum number of issuers that may be whitelisted at once.
+pub const MAX_ISSUERS: u32 = 64;
+
 pub fn initialize(env: &Env, admin: Address) {
     if env.storage().instance().has(&ADMIN) {
         panic!("already initialized");
@@ -12,6 +15,18 @@ pub fn initialize(env: &Env, admin: Address) {
 pub fn require_admin(env: &Env) {
     let admin: Address = env.storage().instance().get(&ADMIN).expect("not initialized");
     admin.require_auth();
+}
+
+/// Result-returning admin check for use by the admin API. Returns `Ok(())` if
+/// the stored admin has authorized the invocation, otherwise an error.
+pub fn try_require_admin(env: &Env) -> Result<(), &'static str> {
+    let admin: Address = env
+        .storage()
+        .instance()
+        .get(&ADMIN)
+        .ok_or("not initialized")?;
+    admin.require_auth();
+    Ok(())
 }
 
 pub fn get_issuers(env: &Env) -> Vec<Address> {
@@ -27,19 +42,40 @@ pub fn require_issuer(env: &Env, issuer: &Address) {
     }
 }
 
-pub fn add_issuer(env: &Env, issuer: Address) {
-    require_admin(env);
-    let mut issuers = get_issuers(env);
-    if !issuers.contains(&issuer) {
-        issuers.push_back(issuer.clone());
-        env.storage().instance().set(&ISSUER, &issuers);
-        env.events().publish((ISSUER, symbol_short!("added")), issuer);
+/// Result-returning issuer check for use by the admin API. Returns `Ok(())`
+/// if `issuer` is whitelisted, otherwise an error.
+pub fn try_require_issuer(env: &Env, issuer: &Address) -> Result<(), &'static str> {
+    if !get_issuers(env).contains(issuer) {
+        return Err("not a registered issuer");
     }
+    Ok(())
 }
 
-pub fn remove_issuer(env: &Env, issuer: Address) {
-    require_admin(env);
+/// Adds `issuer` to the whitelist. Admin-only. Returns an error if the issuer
+/// is already registered or if the whitelist is at capacity.
+pub fn add_issuer(env: &Env, issuer: Address) -> Result<(), &'static str> {
+    try_require_admin(env)?;
+    let mut issuers = get_issuers(env);
+    if issuers.contains(&issuer) {
+        return Err("issuer already registered");
+    }
+    if issuers.len() >= MAX_ISSUERS {
+        return Err("issuer whitelist full");
+    }
+    issuers.push_back(issuer.clone());
+    env.storage().instance().set(&ISSUER, &issuers);
+    env.events().publish((ISSUER, symbol_short!("added")), issuer);
+    Ok(())
+}
+
+/// Removes `issuer` from the whitelist. Admin-only. Returns an error if the
+/// issuer is not currently registered.
+pub fn remove_issuer(env: &Env, issuer: Address) -> Result<(), &'static str> {
+    try_require_admin(env)?;
     let issuers = get_issuers(env);
+    if !issuers.contains(&issuer) {
+        return Err("issuer not registered");
+    }
     let mut updated = Vec::new(env);
     for i in issuers.iter() {
         if i != issuer {
@@ -47,6 +83,9 @@ pub fn remove_issuer(env: &Env, issuer: Address) {
         }
     }
     env.storage().instance().set(&ISSUER, &updated);
+    env.events()
+        .publish((ISSUER, symbol_short!("removed")), issuer);
+    Ok(())
 }
 
 /// Returns true if the given credential type is allowed to be transferred.
@@ -108,6 +147,74 @@ pub fn get_credential_issuer(env: &Env, credential_id: u64) -> Option<Address> {
     env.storage()
         .persistent()
         .get(&(symbol_short!("iss"), credential_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    fn setup() -> (Env, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        initialize(&env, admin.clone());
+        (env, admin)
+    }
+
+    #[test]
+    fn add_issuer_registers_and_emits() {
+        let (env, _admin) = setup();
+        let issuer = Address::generate(&env);
+        assert!(add_issuer(&env, issuer.clone()).is_ok());
+        assert!(get_issuers(&env).contains(&issuer));
+        assert!(try_require_issuer(&env, &issuer).is_ok());
+    }
+
+    #[test]
+    fn add_duplicate_issuer_errors() {
+        let (env, _admin) = setup();
+        let issuer = Address::generate(&env);
+        assert!(add_issuer(&env, issuer.clone()).is_ok());
+        assert_eq!(
+            add_issuer(&env, issuer.clone()),
+            Err("issuer already registered")
+        );
+        assert_eq!(get_issuers(&env).len(), 1);
+    }
+
+    #[test]
+    fn remove_issuer_unregisters() {
+        let (env, _admin) = setup();
+        let issuer = Address::generate(&env);
+        assert!(add_issuer(&env, issuer.clone()).is_ok());
+        assert!(remove_issuer(&env, issuer.clone()).is_ok());
+        assert!(!get_issuers(&env).contains(&issuer));
+        assert!(try_require_issuer(&env, &issuer).is_err());
+    }
+
+    #[test]
+    fn remove_nonexistent_issuer_errors() {
+        let (env, _admin) = setup();
+        let issuer = Address::generate(&env);
+        assert_eq!(
+            remove_issuer(&env, issuer.clone()),
+            Err("issuer not registered")
+        );
+        assert_eq!(get_issuers(&env).len(), 0);
+    }
+
+    #[test]
+    fn add_issuer_respects_capacity() {
+        let (env, _admin) = setup();
+        for _ in 0..MAX_ISSUERS {
+            let issuer = Address::generate(&env);
+            assert!(add_issuer(&env, issuer).is_ok());
+        }
+        let extra = Address::generate(&env);
+        assert_eq!(add_issuer(&env, extra), Err("issuer whitelist full"));
+        assert_eq!(get_issuers(&env).len(), MAX_ISSUERS);
+    }
 }
 
 /// Returns the current threshold signer set, if one has been configured.

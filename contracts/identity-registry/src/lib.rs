@@ -70,6 +70,8 @@ pub enum ContractError {
     UpgradeUnauthorized = 32,
     /// `upgrade` was given a version that is not strictly greater than the stored one.
     InvalidUpgradeVersion = 33,
+    /// The requested DID document version does not exist.
+    VersionNotFound = 34,
 }
 
 /// Version returned by `ping` for deployment health checks.
@@ -128,6 +130,10 @@ pub const MAX_RESOLVER_CACHE_TTL: u32 = 518_400;
 /// in a single call. Set lower than creation batch to account for additional
 /// validation overhead (existence checks, deactivation status).
 pub const MAX_BATCH_UPDATE_SIZE: u32 = 20;
+
+/// Maximum number of historical DID document revisions retained per DID.
+/// Older revisions are dropped once this cap is reached (oldest first).
+pub const MAX_DID_HISTORY: u32 = 20;
 
 // ── Data types ────────────────────────────────────────────────────────────────
 
@@ -191,6 +197,19 @@ pub struct Delegation {
     pub depth: u32,
     pub created_at: u64,
     pub active: bool,
+}
+
+/// A single historical revision of a DID document.
+///
+/// `version` is monotonically increasing per DID, starting at 1 for the
+/// document as created. `timestamp` is the ledger timestamp at which the
+/// revision was superseded by a newer one.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DidVersion {
+    pub version: u32,
+    pub timestamp: u64,
+    pub document: DidDocument,
 }
 
 #[contract]
@@ -494,8 +513,10 @@ impl IdentityRegistry {
             return Err(ContractError::DidDeactivated);
         }
         Self::ensure_cid_immutable(&env, &doc.metadata, &metadata)?;
+        let now = env.ledger().timestamp();
+        Self::push_history(&env, &controller, &doc, now);
         doc.metadata = metadata;
-        doc.updated_at = env.ledger().timestamp();
+        doc.updated_at = now;
         storage.set(&key, &doc);
         storage.extend_ttl(&key, TTL_BUMP_THRESHOLD, TTL_LEDGERS);
         let mut hash_input = Self::string_to_bytes(&env, &doc.id);
@@ -604,10 +625,11 @@ impl IdentityRegistry {
             let update_result: Result<(), ContractError> = (|| {
                 let key = Self::did_key(&env, &controller);
                 let mut doc: DidDocument = storage.get(&key).ok_or(ContractError::DidNotFound)?;
-                
+
+                Self::push_history(&env, &controller, &doc, now);
                 doc.metadata = metadata.clone();
                 doc.updated_at = now;
-                
+
                 storage.set(&key, &doc);
                 storage.extend_ttl(&key, TTL_BUMP_THRESHOLD, TTL_LEDGERS);
                 
@@ -734,6 +756,34 @@ impl IdentityRegistry {
             return Err(ContractError::DidDeactivated);
         }
         Ok(())
+    }
+
+    /// Returns the ordered history of prior revisions of a DID document,
+    /// oldest first. The current (live) document is not included; it is
+    /// available via [`Self::resolve_did`].
+    ///
+    /// At most [`MAX_DID_HISTORY`] revisions are retained per DID; once the
+    /// cap is reached the oldest revision is dropped on each new update.
+    ///
+    /// # Errors
+    /// Returns [`ContractError::DidNotFound`] if no DID exists for `controller`.
+    pub fn get_did_history(env: Env, controller: Address) -> Result<Vec<DidVersion>, ContractError> {
+        let key = Self::did_key(&env, &controller);
+        if !env.storage().persistent().has(&key) {
+            return Err(ContractError::DidNotFound);
+        }
+        let history_key = Self::history_key(&env, &controller);
+        let history: Vec<DidVersion> = env
+            .storage()
+            .persistent()
+            .get(&history_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if !history.is_empty() {
+            env.storage()
+                .persistent()
+                .extend_ttl(&history_key, TTL_BUMP_THRESHOLD, TTL_LEDGERS);
+        }
+        Ok(history)
     }
 
     // ── DID registry interface (#1265 / #1266 / #1267) ────────────────────────
@@ -1228,6 +1278,34 @@ impl IdentityRegistry {
     fn did_key(env: &Env, controller: &Address) -> (Symbol, BytesN<32>) {
         let key_bytes = env.crypto().sha256(&controller.clone().to_xdr(env));
         (IDENTITY, key_bytes.into())
+    }
+
+    fn history_key(env: &Env, controller: &Address) -> (Symbol, BytesN<32>) {
+        let key_bytes = env.crypto().sha256(&controller.clone().to_xdr(env));
+        (symbol_short!("DIDHIST"), key_bytes.into())
+    }
+
+    /// Appends the current state of `doc` to the DID's version history before
+    /// it is superseded. The stored revision number is the length of the
+    /// existing history plus one, so versions are contiguous and monotonic.
+    /// When the history is full, the oldest revision is dropped.
+    fn push_history(env: &Env, controller: &Address, doc: &DidDocument, now: u64) {
+        let storage = env.storage().persistent();
+        let history_key = Self::history_key(env, controller);
+        let mut history: Vec<DidVersion> = storage
+            .get(&history_key)
+            .unwrap_or_else(|| Vec::new(env));
+        let version = history.len() + 1;
+        history.push_back(DidVersion {
+            version,
+            timestamp: now,
+            document: doc.clone(),
+        });
+        while history.len() > MAX_DID_HISTORY {
+            history.pop_front();
+        }
+        storage.set(&history_key, &history);
+        storage.extend_ttl(&history_key, TTL_BUMP_THRESHOLD, TTL_LEDGERS);
     }
 
     /// Storage key for a DID string registered through the registry interface.
@@ -2097,6 +2175,98 @@ mod tests {
             client.try_revoke_delegation(&parent, &child),
             Err(Ok(ContractError::DelegationRevoked))
         );
+    }
+
+    // ── DID document versioning (#1288) ──────────────────────────────────────
+
+    #[test]
+    fn test_history_empty_for_fresh_did() {
+        let (env, client) = setup();
+        let user = Address::generate(&env);
+        client.create_did(&user, &Map::new(&env));
+        assert_eq!(client.get_did_history(&user).len(), 0);
+    }
+
+    #[test]
+    fn test_history_records_prior_revisions_on_update() {
+        let (env, client) = setup();
+        let user = Address::generate(&env);
+        client.create_did(&user, &Map::new(&env));
+
+        let mut meta1: Map<String, String> = Map::new(&env);
+        meta1.set(String::from_str(&env, "name"), String::from_str(&env, "first"));
+        client.update_did(&user, &meta1);
+
+        let mut meta2: Map<String, String> = Map::new(&env);
+        meta2.set(String::from_str(&env, "name"), String::from_str(&env, "second"));
+        client.update_did(&user, &meta2);
+
+        let history = client.get_did_history(&user);
+        assert_eq!(history.len(), 2);
+
+        let v1 = history.get(0).unwrap();
+        assert_eq!(v1.version, 1);
+        assert_eq!(v1.document.metadata.len(), 0);
+
+        let v2 = history.get(1).unwrap();
+        assert_eq!(v2.version, 2);
+        assert_eq!(
+            v2.document.metadata.get(String::from_str(&env, "name")),
+            Some(String::from_str(&env, "first"))
+        );
+
+        // The live document holds the latest metadata.
+        let doc = client.resolve_did(&user);
+        assert_eq!(
+            doc.metadata.get(String::from_str(&env, "name")),
+            Some(String::from_str(&env, "second"))
+        );
+    }
+
+    #[test]
+    fn test_history_is_bounded() {
+        let (env, client) = setup();
+        let user = Address::generate(&env);
+        client.create_did(&user, &Map::new(&env));
+        for i in 0..(MAX_DID_HISTORY + 5) {
+            let mut meta: Map<String, String> = Map::new(&env);
+            meta.set(String::from_str(&env, "n"), String::from_str(&env, "v"));
+            meta.set(String::from_str(&env, "i"), String::from_str(&env, "x"));
+            let _ = i;
+            client.update_did(&user, &meta);
+        }
+        let history = client.get_did_history(&user);
+        assert_eq!(history.len(), MAX_DID_HISTORY);
+        // Versions remain contiguous and end at the total number of updates.
+        assert_eq!(history.get(0).unwrap().version, 6);
+        assert_eq!(
+            history.get(MAX_DID_HISTORY - 1).unwrap().version,
+            MAX_DID_HISTORY + 5
+        );
+    }
+
+    #[test]
+    fn test_history_unknown_did_returns_error() {
+        let (env, client) = setup();
+        let user = Address::generate(&env);
+        assert_eq!(client.try_get_did_history(&user), Err(Ok(ContractError::DidNotFound)));
+    }
+
+    #[test]
+    fn test_batch_update_records_history() {
+        let (env, client) = setup();
+        let user = Address::generate(&env);
+        client.create_did(&user, &Map::new(&env));
+
+        let mut meta: Map<String, String> = Map::new(&env);
+        meta.set(String::from_str(&env, "k"), String::from_str(&env, "v"));
+        let mut entries = Vec::new(&env);
+        entries.push_back((user.clone(), meta));
+        client.update_dids_batch(&entries);
+
+        let history = client.get_did_history(&user);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history.get(0).unwrap().version, 1);
     }
 
     // ── DID registry interface tests (#1265 / #1266 / #1267) ─────────────────
