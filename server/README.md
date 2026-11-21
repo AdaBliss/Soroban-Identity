@@ -39,6 +39,10 @@ The server configuration can be customized using the following environment varia
 | `RATE_LIMIT_PREMIUM_TIERS` | Tiers that bypass all rate limits. | `premium,enterprise` |
 | `RATE_LIMIT_PREMIUM_KEYS` | Comma-separated API key ids that bypass all rate limits. | unset |
 | `TRUST_PROXY` | Trust `X-Forwarded-For` when resolving the client IP. | `false` |
+| `JWT_SECRET` / `JWT_PUBLIC_KEY` | Secret or public key used to verify signed bearer JWTs. | unset |
+| `JWT_ALGORITHMS` | Allowed JWT algorithms (`HS256`, `RS256`, `ES256`, or `EdDSA`). | `HS256` |
+| `JWT_ISSUER` / `JWT_AUDIENCE` | Optional issuer and audience checks for JWTs. | unset |
+| `WEB3_STORAGE_TOKEN` | Token used to pin DID JSON documents to web3.storage. | unset |
 
 Admin requests are checked against `ADMIN_IP_ALLOWLIST` before API key or OAuth
 authentication. For example, `ADMIN_IP_ALLOWLIST=203.0.113.8,198.51.100.0/24,2001:db8::/32`
@@ -103,6 +107,20 @@ Build the image from the repository root with `docker build -f server/Dockerfile
 
 Two budgets apply to every non-exempt request, and both must be satisfied.
 `/info`, `/health`, and `/metrics` are exempt.
+
+Public requests are limited to 100 requests per minute per IP. A verified JWT
+whose `sub` is a Stellar public key is treated as an issuer and receives a
+separate 1000 requests per minute per-issuer budget. The IP budget still
+applies to authenticated traffic to prevent shared-address abuse.
+
+### Indexed events and DID metadata
+
+Run Flyway with `server/flyway.conf` and `DATABASE_URL` to apply the versioned
+schema in `server/migrations`. The first migration creates `identities`,
+`attestations`, and `events` with JSONB payloads and indexes for ledger and
+issuer queries. When `WEB3_STORAGE_TOKEN` is configured, DID writes pin the DID
+JSON and add the returned `cid`/`ipfs_cid` to the identity contract metadata.
+The contract keeps that CID immutable on later metadata updates.
 
 ### Per-endpoint limits
 

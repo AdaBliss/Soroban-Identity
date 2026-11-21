@@ -25,8 +25,8 @@ import { TieredRateLimiter } from '../rate-limiter.js';
  */
 
 export const DEFAULT_STRATEGIES = {
-  ip: { ratePerMinute: 300, burst: 60 },
-  user: { ratePerMinute: 600, burst: 120 },
+  ip: { ratePerMinute: 100, burst: 0 },
+  user: { ratePerMinute: 1000, burst: 0 },
 };
 
 export const DEFAULT_PREMIUM_TIERS = ['premium', 'enterprise'];
