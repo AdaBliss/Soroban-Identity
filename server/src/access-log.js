@@ -233,16 +233,19 @@ export class RotatingFileSink {
  * Build the structured record for one completed request.
  */
 export function buildAccessRecord(req, res, { requestId, startedAt, config, requestBody, responseBody }) {
-  const durationMs = Number((Date.now() - startedAt).toFixed(3));
+  const latencyMs = Number((Date.now() - startedAt).toFixed(3));
   const status = res.statusCode;
+
+  const did = req.params?.did ?? req.did ?? req.context?.did ?? null;
 
   const record = {
     type: 'http_access',
     requestId,
+    did,
     method: req.method,
     path: req.url,
     status,
-    durationMs,
+    latencyMs,
     ip: resolveClientIp(req, { trustProxy: config.trustProxy }),
     userAgent: req.headers?.['user-agent'] ?? null,
     contentLength: res.getHeader?.('content-length') ?? null,
