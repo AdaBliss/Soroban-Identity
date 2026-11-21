@@ -1,5 +1,6 @@
 import { useState, useEffect, useReducer, useRef, lazy, Suspense } from "react";
-import { StrKey, SorobanRpc, TransactionBuilder, BASE_FEE, nativeToScVal, Contract, scValToNative } from '@stellar/stellar-sdk';
+import { StrKey, nativeToScVal, scValToNative } from '@stellar/stellar-sdk';
+import { useSorobanInvoke } from '../hooks/useSorobanInvoke';
 import type { CredentialType, Credential, RevocationReason, VerifyResult } from "../../../sdk/src/types";
 import { REVOCATION_REASONS } from "../../../sdk/src/types";
 import { CredentialClient } from '../../../sdk/src';
@@ -337,6 +338,7 @@ function credentialReducer(_state: CredentialState, action: CredentialAction): C
 export default function CredentialsPanel({ verifyId, wallet: propWallet }: { verifyId?: string | null; wallet?: any } = {}) {
   const contextWallet = useWalletContext();
   const wallet = propWallet ?? contextWallet;
+  const invokeContract = useSorobanInvoke(propWallet);
   const toast = useToast();
   const [credentialState, dispatchCredential] = useReducer(credentialReducer, { status: 'idle' });
 
@@ -1039,12 +1041,6 @@ export default function CredentialsPanel({ verifyId, wallet: propWallet }: { ver
     setIssueResult(null);
     try {
       const networkConfig = getNetworkConfig();
-      const rpcUrl = typeof networkConfig.rpcUrl === 'string' ? networkConfig.rpcUrl : networkConfig.rpcUrl[0];
-      const server = new SorobanRpc.Server(rpcUrl);
-      const contract = new Contract(networkConfig.credentialManagerId);
-
-      // #738: wrap every RPC call so 429/503 responses are retried with backoff
-      const account = await withRpcRetry(() => server.getAccount(wallet.publicKey!));
 
       const claimsMap = claims.reduce((acc, { key, value }) => {
         if (key.trim() && value.trim()) acc[key.trim()] = value.trim();
@@ -1054,44 +1050,24 @@ export default function CredentialsPanel({ verifyId, wallet: propWallet }: { ver
       const claimsHashHex = "0000000000000000000000000000000000000000000000000000000000000000";
       const sigHex = Buffer.alloc(64, 0).toString("hex");
 
-      const tx = new TransactionBuilder(account, {
-        fee: BASE_FEE,
-        networkPassphrase: networkConfig.networkPassphrase,
-      })
-        .addOperation(
-          contract.call(
-            "issue_credential",
-            nativeToScVal(wallet.publicKey, { type: "address" }),
-            nativeToScVal(subject.trim(), { type: "address" }),
-            nativeToScVal("Kyc", { type: "symbol" }),
-            nativeToScVal(claimsMap, { type: "map" }),
-            nativeToScVal(Buffer.from(claimsHashHex, "hex"), { type: "bytes" }),
-            nativeToScVal(Buffer.from(sigHex, "hex"), { type: "bytes" }),
-            nativeToScVal(BigInt((expiresAt || "0").trim() || "0"), { type: "u64" })
-          )
-        )
-        .setTimeout(30)
-        .build();
+      // #738: every RPC call made by the shared invoke path is retried with
+      // backoff on 429/503 responses; signing still goes through Freighter.
+      const { fee: estimatedFee, returnValue } = await invokeContract({
+        contractId: networkConfig.credentialManagerId,
+        method: "issue_credential",
+        args: [
+          nativeToScVal(wallet.publicKey, { type: "address" }),
+          nativeToScVal(subject.trim(), { type: "address" }),
+          nativeToScVal("Kyc", { type: "symbol" }),
+          nativeToScVal(claimsMap, { type: "map" }),
+          nativeToScVal(Buffer.from(claimsHashHex, "hex"), { type: "bytes" }),
+          nativeToScVal(Buffer.from(sigHex, "hex"), { type: "bytes" }),
+          nativeToScVal(BigInt((expiresAt || "0").trim() || "0"), { type: "u64" }),
+        ],
+        withRetry: withRpcRetry,
+      });
 
-      const prepared = await withRpcRetry(() => server.prepareTransaction(tx));
-      const estimatedFee = parseInt(prepared.fee, 10);
-      const signedXdr = await wallet.signTransaction(prepared.toXDR());
-      const signedTx = TransactionBuilder.fromXDR(signedXdr, networkConfig.networkPassphrase);
-
-      // sendTransaction itself is idempotent — retrying is safe
-      const result = await withRpcRetry(() => server.sendTransaction(signedTx as any));
-
-      if (result.status !== "PENDING") throw new Error(`Transaction failed: ${result.status}`);
-
-      // Poll until the transaction is confirmed, with backoff on rate errors
-      let txStatus = await withRpcRetry(() => server.getTransaction(result.hash));
-      while (txStatus.status === "NOT_FOUND") {
-        await new Promise(r => setTimeout(r, 2000));
-        txStatus = await withRpcRetry(() => server.getTransaction(result.hash));
-      }
-      if (txStatus.status === "FAILED") throw new Error("Transaction failed on-chain");
-
-      const raw = scValToNative((txStatus as any).returnValue) as Uint8Array;
+      const raw = scValToNative(returnValue as any) as Uint8Array;
       const credentialId = Buffer.from(raw).toString("hex");
 
       setIssueResult(`Credential issued successfully!\nID: ${credentialId}\nEstimated fee: ${(estimatedFee / 10_000_000).toFixed(7)} XLM`);
