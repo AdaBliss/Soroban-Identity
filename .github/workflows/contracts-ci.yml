@@ -111,6 +111,10 @@ jobs:
         working-directory: contracts/identity-registry
         run: cargo test
 
+      - name: Test governance
+        working-directory: contracts/governance
+        run: cargo test
+
       - name: Test credential-manager
         working-directory: contracts/credential-manager
         run: cargo test

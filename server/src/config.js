@@ -280,6 +280,14 @@ export function loadConfig(env = process.env) {
     mockApiEnabled: nodeEnv !== "production" && parseBoolean(env.MOCK_API_ENABLED, false),
     port: parseInteger(env.PORT, 3001),
     adminApiKey: env.ADMIN_API_KEY ?? "",
+    jwtSecret: env.JWT_SECRET ?? "",
+    jwtPublicKey: env.JWT_PUBLIC_KEY ?? "",
+    jwtAlgorithms: (env.JWT_ALGORITHMS ?? "HS256").split(",").map((value) => value.trim()).filter(Boolean),
+    jwtIssuer: env.JWT_ISSUER ?? "",
+    jwtAudience: env.JWT_AUDIENCE ?? "",
+    jwtClockSkewSeconds: parseInteger(env.JWT_CLOCK_SKEW_SECONDS, 30, true),
+    web3StorageToken: env.WEB3_STORAGE_TOKEN ?? "",
+    ipfsOnChainEnabled: parseBoolean(env.IPFS_ON_CHAIN_ENABLED, true),
     adminIpAllowlist: parseList(env.ADMIN_IP_ALLOWLIST, []),
     // Production admin routes are unavailable until an explicit allowlist is
     // supplied. Set ADMIN_IP_ALLOWLIST_REQUIRED=false only for a deliberate
@@ -386,6 +394,7 @@ export function loadConfig(env = process.env) {
     vcProofPrivateKey: env.VC_PROOF_PRIVATE_KEY ?? "",
     // Defaults to "<issuer DID>#key-1" when unset.
     vcProofVerificationMethod: env.VC_PROOF_VERIFICATION_METHOD ?? "",
+    databaseUrl: env.DATABASE_URL ?? "",
     dataDir: env.DATA_DIR ? path.resolve(env.DATA_DIR) : DEFAULT_DATA_DIR,
     auditLogPath: env.AUDIT_LOG_PATH
       ? path.resolve(env.AUDIT_LOG_PATH)
@@ -415,10 +424,10 @@ export function loadConfig(env = process.env) {
       .filter(Boolean),
     rateLimitMaxBuckets: parseInteger(env.RATE_LIMIT_MAX_BUCKETS, 10000),
     // #956: per-IP and per-user token buckets, plus premium bypass.
-    rateLimitIpPerMinute: parseInteger(env.RATE_LIMIT_IP_PER_MINUTE, 300),
-    rateLimitIpBurst: parseInteger(env.RATE_LIMIT_IP_BURST, 60),
-    rateLimitUserPerMinute: parseInteger(env.RATE_LIMIT_USER_PER_MINUTE, 600),
-    rateLimitUserBurst: parseInteger(env.RATE_LIMIT_USER_BURST, 120),
+    rateLimitIpPerMinute: parseInteger(env.RATE_LIMIT_IP_PER_MINUTE, 100),
+    rateLimitIpBurst: parseInteger(env.RATE_LIMIT_IP_BURST, 0, true),
+    rateLimitUserPerMinute: parseInteger(env.RATE_LIMIT_USER_PER_MINUTE, 1000),
+    rateLimitUserBurst: parseInteger(env.RATE_LIMIT_USER_BURST, 0, true),
     rateLimitPremiumTiers: (env.RATE_LIMIT_PREMIUM_TIERS ?? "premium,enterprise")
       .split(",")
       .map((entry) => entry.trim().toLowerCase())
