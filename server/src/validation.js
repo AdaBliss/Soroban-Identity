@@ -206,10 +206,31 @@ export const schemas = {
   graphql: looseObject({
     body: looseObject({ query: z.string().min(1), variables: z.record(z.string(), z.unknown()).optional(), operationName: optionalText }),
   }),
-  addIssuer: looseObject({ body: looseObject({ issuer: z.string().min(1) }) }),
+  addIssuer: looseObject({
+    body: looseObject({
+      issuer: z.string().transform(sanitizeString).refine((v) => STELLAR_ACCOUNT_RE.test(v), {
+        message: 'Must be a valid Stellar account address (G followed by 55 base32 characters)',
+      }),
+    }),
+  }),
   removeIssuer: looseObject({
-    body: looseObject({ issuer: z.string().min(1).optional() }),
-    query: looseObject({ issuer: optionalText }),
+    body: looseObject({
+      issuer: z.string().transform(sanitizeString).refine((v) => STELLAR_ACCOUNT_RE.test(v), {
+        message: 'Must be a valid Stellar account address (G followed by 55 base32 characters)',
+      }).optional(),
+    }),
+    query: looseObject({
+      issuer: z.string().transform(sanitizeString).refine((v) => STELLAR_ACCOUNT_RE.test(v), {
+        message: 'Must be a valid Stellar account address (G followed by 55 base32 characters)',
+      }).optional(),
+    }),
+  }),
+  didHistoryParams: looseObject({
+    params: looseObject({ did: z.string().min(1) }),
+    query: looseObject({
+      limit: z.coerce.number().int().min(1).max(200).optional(),
+      cursor: optionalText,
+    }).optional(),
   }),
   expiryReportQuery: looseObject({
     query: looseObject({ ...queryFields, days: z.coerce.number().int().min(1).max(3650).optional() }),

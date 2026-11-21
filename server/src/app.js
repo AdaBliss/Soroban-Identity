@@ -11,6 +11,8 @@ import {
   updateAndPersistCredential,
   DuplicateCredentialError,
   ConcurrencyConflictError,
+  appendDidVersion,
+  readDidVersions,
 } from "./storage.js";
 import { findExpiringCredentials, paginate } from "./expiry.js";
 import {
@@ -514,7 +516,24 @@ export function createApp({
         config,
         sink: accessLogSink,
       });
-      res.on("finish", () => finishAccessLog({ requestBody: req.loggedBody ?? null }));
+      res.on("finish", () => {
+        // #1289: structured access log entries carry the DID route param
+        // (when present) and the measured latency alongside the request id.
+        const didParam = (() => {
+          const match = pathname.match(/^\/(?:identity|dids)\/([^/]+)/);
+          if (!match) return null;
+          try {
+            return decodeURIComponent(match[1]);
+          } catch {
+            return match[1];
+          }
+        })();
+        finishAccessLog({
+          requestBody: req.loggedBody ?? null,
+          did: didParam,
+          latencyMs: Math.max(0, Date.now() - startTime),
+        });
+      });
     }
 
     // Origin-side DDoS controls run before authentication, body parsing, or RPC work.
@@ -2063,6 +2082,12 @@ export function createApp({
             if (didCache) {
               await didCache.set(address, persistedDidDoc);
             }
+            // #1288: persist a historical version of the DID document so the
+            // history endpoint can return the full change timeline.
+            await appendDidVersion(config, address, didDoc, {
+              action: "create",
+              actor: req.headers["x-actor"] ?? config.adminActor ?? null,
+            });
             const didLinks = buildDidLinks(persistedDidDoc, linkPrefix);
             return sendJson(
               res,
@@ -2159,6 +2184,11 @@ export function createApp({
               if (didCache) {
                 await didCache.set(address, persistedDidDoc);
               }
+              // #1288: record the new version of the DID document.
+              await appendDidVersion(config, address, updatedDoc, {
+                action: req.method === "PATCH" ? "patch" : "update",
+                actor: req.headers["x-actor"] ?? config.adminActor ?? null,
+              });
               const didLinks = buildDidLinks(persistedDidDoc, linkPrefix);
               return sendJson(
                 res,
@@ -2178,6 +2208,63 @@ export function createApp({
             }
             throw err;
           }
+        }
+
+        // ── DID document history (#1288) ───────────────────────────────
+        // GET /identity/:did/history returns the stored versions of a DID
+        // document, newest first, paginated with opaque cursors.
+        const didHistoryMatch = pathname.match(/^\/identity\/([^/]+)\/history$/);
+        if (req.method === "GET" && didHistoryMatch) {
+          let rawDid;
+          try {
+            rawDid = decodeURIComponent(didHistoryMatch[1]);
+          } catch {
+            return sendJson(res, 400, { code: "INVALID_DID", message: "Malformed URL-encoded DID parameter." });
+          }
+          const identifierCheck = validateDidInput(rawDid, { field: "did" });
+          if (!identifierCheck.ok) {
+            return sendJson(res, 400, {
+              error: "invalid_did",
+              code: "INVALID_DID",
+              message: identifierCheck.message,
+              details: [{ field: "did", value: rawDid, code: "invalid_did" }],
+            });
+          }
+          const address = identifierCheck.address;
+
+          const validated = validateRequest(res, schemas.didHistoryQuery, { query: url.searchParams });
+          if (!validated.ok) return;
+          const limitNum = validated.data.query.limit ?? 50;
+          const direction = validated.data.query.direction ?? "next";
+
+          const versions = await readDidVersions(config, address);
+          if (!versions || versions.length === 0) {
+            // Distinguish "DID exists but has no recorded history" from
+            // "DID is unknown": fall back to the resolver before 404ing.
+            const doc = soroban?.resolveDid ? await soroban.resolveDid(address) : null;
+            if (!doc) return notFound(res, req);
+            return sendJson(res, 200, {
+              did: `did:stellar:${address}`,
+              versions: [],
+              nextCursor: null,
+              previousCursor: null,
+              pagination: { limit: limitNum, count: 0 },
+            });
+          }
+
+          const { items, nextCursor, previousCursor, pagination } = cursorPage(versions, {
+            limit: limitNum,
+            cursor: validated.data.query.cursor ?? null,
+            direction,
+          });
+          setPaginationHeaders(res, url, pagination);
+          return sendJson(res, 200, {
+            did: `did:stellar:${address}`,
+            versions: items,
+            nextCursor,
+            previousCursor,
+            pagination,
+          });
         }
 
         if (req.method === "GET" && pathname === "/notifications/summary") {
@@ -2258,7 +2345,10 @@ export function createApp({
           return sendFormatted(req, res, 200, { issuers, pagination });
         }
 
+        // ── Issuer whitelist management (#1290) ────────────────────────
+        // Admin-only endpoints that add/remove trusted issuers on-chain.
         if (req.method === "POST" && pathname === "/admin/issuers") {
+          if (!await requireAuth(req, res, config, ['admin:write'])) return;
           if (validateContentType(req, res)) return;
           const body = await readJson(req, config);
           if (body.__payloadTooLarge)
@@ -2273,7 +2363,7 @@ export function createApp({
             actor: req.headers["x-actor"] ?? config.adminActor,
             issuer,
           });
-          return sendFormatted(req, res, 201, { issuer: body.issuer });
+          return sendFormatted(req, res, 201, { issuer });
         }
 
         if (req.method === "DELETE" && pathname === "/admin/issuers") {
