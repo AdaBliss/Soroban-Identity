@@ -138,6 +138,8 @@ pub enum EventType {
     DidMethodRegistered,
     /// A DID was resolved through the resolver
     DidResolved,
+    /// An attestation was issued for a DID
+    AttestationIssued,
     /// DID resolution result was cached
     DidResolutionCached,
     /// Custom DID resolver plugin was registered
@@ -213,6 +215,44 @@ pub enum DidEvent {
         did: String,
         controller: Address,
         deactivated_at: u64,
+    },
+}
+
+/// DID identity events emitted by the identity contract.
+///
+/// These carry the DID identifier, its owner and the metadata hash so that
+/// indexers and subscribers can reconstruct the DID document state.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub enum DidIdentityEvent {
+    /// A new DID was created and its initial metadata hash stored.
+    Created {
+        did: String,
+        owner: Address,
+        metadata_hash: BytesN<32>,
+        created_at: u64,
+    },
+    /// A DID's metadata hash was updated.
+    Updated {
+        did: String,
+        owner: Address,
+        metadata_hash: BytesN<32>,
+        updated_at: u64,
+    },
+}
+
+/// Attestation events emitted by the identity contract.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub enum AttestationEvent {
+    /// A trusted issuer issued an attestation for a DID.
+    Issued {
+        attestation_id: BytesN<32>,
+        did: String,
+        issuer: Address,
+        claim_type: String,
+        expiry: u64,
+        issued_at: u64,
     },
 }
 
@@ -507,6 +547,8 @@ pub enum PresentationEvent {
 pub enum EventPayload {
     Credential(CredentialEvent),
     Did(DidEvent),
+    DidIdentity(DidIdentityEvent),
+    Attestation(AttestationEvent),
     Reputation(ReputationEvent),
     Escrow(EscrowEvent),
     Oracle(OracleEvent),
@@ -734,6 +776,19 @@ impl EventEmitter {
                 };
                 env.events().publish((topic.clone(), emitter, timestamp), topic);
             }
+            EventPayload::DidIdentity(did_event) => {
+                let topic = match did_event {
+                    DidIdentityEvent::Created { .. } => symbol_short!("did_crt"),
+                    DidIdentityEvent::Updated { .. } => symbol_short!("did_upd"),
+                };
+                env.events().publish((topic, emitter, timestamp), payload);
+            }
+            EventPayload::Attestation(att_event) => {
+                let topic = match att_event {
+                    AttestationEvent::Issued { .. } => symbol_short!("att_iss"),
+                };
+                env.events().publish((topic, emitter, timestamp), payload);
+            }
             EventPayload::Reputation(rep_event) => {
                 let topic = match rep_event {
                     ReputationEvent::ScoreSubmitted { .. } => symbol_short!("rep_score"),
@@ -833,6 +888,13 @@ impl EventEmitter {
                 DidEvent::Registered { .. } => EventType::DidRegistered,
                 DidEvent::Updated { .. } => EventType::DidUpdated,
                 DidEvent::Deactivated { .. } => EventType::DidDeactivated,
+            },
+            EventPayload::DidIdentity(did) => match did {
+                DidIdentityEvent::Created { .. } => EventType::DidRegistered,
+                DidIdentityEvent::Updated { .. } => EventType::DidUpdated,
+            },
+            EventPayload::Attestation(att) => match att {
+                AttestationEvent::Issued { .. } => EventType::AttestationIssued,
             },
             EventPayload::Reputation(rep) => match rep {
                 ReputationEvent::ScoreSubmitted { .. } => EventType::ReputationScoreSubmitted,
@@ -1087,6 +1149,56 @@ mod test {
         assert_eq!(
             EventEmitter::event_type_from_payload(&refunded_event),
             EventType::EscrowRefunded
+        );
+    }
+
+    #[test]
+    fn test_did_identity_event_type_from_payload() {
+        let env = Env::default();
+        let owner = Address::generate(&env);
+        let did = String::from_str(&env, "did:stellar:GABC");
+        let metadata_hash = BytesN::from_array(&env, &[7u8; 32]);
+
+        let created = EventPayload::DidIdentity(DidIdentityEvent::Created {
+            did: did.clone(),
+            owner: owner.clone(),
+            metadata_hash: metadata_hash.clone(),
+            created_at: 1,
+        });
+        assert_eq!(
+            EventEmitter::event_type_from_payload(&created),
+            EventType::DidRegistered
+        );
+
+        let updated = EventPayload::DidIdentity(DidIdentityEvent::Updated {
+            did,
+            owner,
+            metadata_hash,
+            updated_at: 2,
+        });
+        assert_eq!(
+            EventEmitter::event_type_from_payload(&updated),
+            EventType::DidUpdated
+        );
+    }
+
+    #[test]
+    fn test_attestation_event_type_from_payload() {
+        let env = Env::default();
+        let issuer = Address::generate(&env);
+        let attestation_id = BytesN::from_array(&env, &[8u8; 32]);
+
+        let issued = EventPayload::Attestation(AttestationEvent::Issued {
+            attestation_id,
+            did: String::from_str(&env, "did:stellar:GABC"),
+            issuer,
+            claim_type: String::from_str(&env, "Kyc"),
+            expiry: 99999,
+            issued_at: 1,
+        });
+        assert_eq!(
+            EventEmitter::event_type_from_payload(&issued),
+            EventType::AttestationIssued
         );
     }
 

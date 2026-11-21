@@ -60,6 +60,22 @@ pub enum DidResolverKey {
     ResolutionCache(String),
     /// Admin authorized to register methods.
     Admin,
+    /// Stored identity documents keyed by DID string.
+    IdentityDocument(String),
+}
+
+/// A stored identity record backing `resolve_identity`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IdentityRecord {
+    pub owner: Address,
+    pub controller: String,
+    pub metadata_hash: Bytes,
+    pub verification_methods: Vec<VerificationMethod>,
+    pub services: Vec<Service>,
+    pub version: u32,
+    pub created_at: u64,
+    pub updated_at: u64,
 }
 
 /// The universal DID resolver.
@@ -363,6 +379,84 @@ impl DidResolver {
             .persistent()
             .remove(&DidResolverKey::ResolutionCache(did));
     }
+
+    /// Persist an identity record for a DID string.
+    pub fn store_identity(
+        env: &Env,
+        did: String,
+        record: IdentityRecord,
+    ) -> Result<(), DidResolverError> {
+        // Validate the DID shape before storing.
+        Self::parse_method(&did)?;
+        env.storage()
+            .persistent()
+            .set(&DidResolverKey::IdentityDocument(did), &record);
+        Ok(())
+    }
+
+    /// Look up the stored identity record for a DID string.
+    fn lookup_identity(
+        env: &Env,
+        did: &String,
+    ) -> Result<IdentityRecord, DidResolverError> {
+        // Reject malformed DIDs before touching storage.
+        Self::parse_method(did)?;
+        env.storage()
+            .persistent()
+            .get(&DidResolverKey::IdentityDocument(did.clone()))
+            .ok_or(DidResolverError::NotFound)
+    }
+
+    /// Build and validate the full DID document for an identity record.
+    fn build_identity_document(
+        env: &Env,
+        did: &String,
+        record: &IdentityRecord,
+    ) -> Result<DidDocument, DidResolverError> {
+        if record.controller.to_string().is_empty() {
+            return Err(DidResolverError::MalformedDid);
+        }
+        if record.version == 0 {
+            return Err(DidResolverError::MalformedDid);
+        }
+        if record.updated_at < record.created_at {
+            return Err(DidResolverError::MalformedDid);
+        }
+
+        let mut vms: Vec<VerificationMethod> = Vec::new(env);
+        for vm in record.verification_methods.iter() {
+            if vm.id.to_string().is_empty() || vm.controller.to_string().is_empty() {
+                return Err(DidResolverError::MalformedDid);
+            }
+            vms.push_back(vm);
+        }
+
+        let mut services: Vec<Service> = Vec::new(env);
+        for svc in record.services.iter() {
+            if svc.id.to_string().is_empty() || svc.endpoint.to_string().is_empty() {
+                return Err(DidResolverError::MalformedDid);
+            }
+            services.push_back(svc);
+        }
+
+        Ok(DidDocument {
+            id: did.clone(),
+            controller: record.controller.clone(),
+            verification_methods: vms,
+            services,
+        })
+    }
+
+    /// Resolve the full DID document for a given identifier.
+    ///
+    /// Returns a typed error when the DID is malformed or unknown; never panics.
+    pub fn resolve_identity(
+        env: &Env,
+        did: String,
+    ) -> Result<DidDocument, DidResolverError> {
+        let record = Self::lookup_identity(env, &did)?;
+        Self::build_identity_document(env, &did, &record)
+    }
 }
 
 #[cfg(test)]
@@ -497,5 +591,72 @@ mod tests {
         DidResolver::clear_cache(&env, did.clone());
         let doc2 = DidResolver::resolve_did(&env, did.clone()).unwrap();
         assert_eq!(doc2.id, did);
+    }
+
+    fn sample_record(env: &Env, did: &String) -> IdentityRecord {
+        let mut vms: Vec<VerificationMethod> = Vec::new(env);
+        vms.push_back(VerificationMethod {
+            id: String::from_slice(env, &format!("{}#keys-1", did.to_string())),
+            method_type: String::from_slice(env, "Ed25519VerificationKey2020"),
+            controller: did.clone(),
+            public_key: Bytes::from_slice(env, &[1u8, 2, 3]),
+        });
+        let mut services: Vec<Service> = Vec::new(env);
+        services.push_back(Service {
+            id: String::from_slice(env, &format!("{}#svc", did.to_string())),
+            service_type: String::from_slice(env, "Messaging"),
+            endpoint: String::from_slice(env, "https://example.com"),
+        });
+        IdentityRecord {
+            owner: Address::generate(env),
+            controller: did.clone(),
+            metadata_hash: Bytes::from_slice(env, &[9u8; 32]),
+            verification_methods: vms,
+            services,
+            version: 1,
+            created_at: 100,
+            updated_at: 200,
+        }
+    }
+
+    #[test]
+    fn test_resolve_identity_ok() {
+        let (env, _admin) = setup();
+        let did = String::from_slice(&env, "did:web:example.com");
+        let record = sample_record(&env, &did);
+        DidResolver::store_identity(&env, did.clone(), record).unwrap();
+
+        let doc = DidResolver::resolve_identity(&env, did.clone()).unwrap();
+        assert_eq!(doc.id, did);
+        assert_eq!(doc.controller, did);
+        assert_eq!(doc.verification_methods.len(), 1);
+        assert_eq!(doc.services.len(), 1);
+    }
+
+    #[test]
+    fn test_resolve_identity_unknown() {
+        let (env, _admin) = setup();
+        let did = String::from_slice(&env, "did:web:unknown.com");
+        let res = DidResolver::resolve_identity(&env, did);
+        assert_eq!(res, Err(DidResolverError::NotFound));
+    }
+
+    #[test]
+    fn test_resolve_identity_malformed() {
+        let (env, _admin) = setup();
+        let did = String::from_slice(&env, "notadid");
+        let res = DidResolver::resolve_identity(&env, did);
+        assert_eq!(res, Err(DidResolverError::MalformedDid));
+    }
+
+    #[test]
+    fn test_resolve_identity_invalid_record() {
+        let (env, _admin) = setup();
+        let did = String::from_slice(&env, "did:web:example.com");
+        let mut record = sample_record(&env, &did);
+        record.version = 0;
+        DidResolver::store_identity(&env, did.clone(), record).unwrap();
+        let res = DidResolver::resolve_identity(&env, did);
+        assert_eq!(res, Err(DidResolverError::MalformedDid));
     }
 }

@@ -280,6 +280,14 @@ export function loadConfig(env = process.env) {
     mockApiEnabled: nodeEnv !== "production" && parseBoolean(env.MOCK_API_ENABLED, false),
     port: parseInteger(env.PORT, 3001),
     adminApiKey: env.ADMIN_API_KEY ?? "",
+    jwtSecret: env.JWT_SECRET ?? "",
+    jwtPublicKey: env.JWT_PUBLIC_KEY ?? "",
+    jwtAlgorithms: (env.JWT_ALGORITHMS ?? "HS256").split(",").map((value) => value.trim()).filter(Boolean),
+    jwtIssuer: env.JWT_ISSUER ?? "",
+    jwtAudience: env.JWT_AUDIENCE ?? "",
+    jwtClockSkewSeconds: parseInteger(env.JWT_CLOCK_SKEW_SECONDS, 30, true),
+    web3StorageToken: env.WEB3_STORAGE_TOKEN ?? "",
+    ipfsOnChainEnabled: parseBoolean(env.IPFS_ON_CHAIN_ENABLED, true),
     adminIpAllowlist: parseList(env.ADMIN_IP_ALLOWLIST, []),
     // Production admin routes are unavailable until an explicit allowlist is
     // supplied. Set ADMIN_IP_ALLOWLIST_REQUIRED=false only for a deliberate
@@ -401,10 +409,10 @@ export function loadConfig(env = process.env) {
       .filter(Boolean),
     rateLimitMaxBuckets: parseInteger(env.RATE_LIMIT_MAX_BUCKETS, 10000),
     // #956: per-IP and per-user token buckets, plus premium bypass.
-    rateLimitIpPerMinute: parseInteger(env.RATE_LIMIT_IP_PER_MINUTE, 300),
-    rateLimitIpBurst: parseInteger(env.RATE_LIMIT_IP_BURST, 60),
-    rateLimitUserPerMinute: parseInteger(env.RATE_LIMIT_USER_PER_MINUTE, 600),
-    rateLimitUserBurst: parseInteger(env.RATE_LIMIT_USER_BURST, 120),
+    rateLimitIpPerMinute: parseInteger(env.RATE_LIMIT_IP_PER_MINUTE, 100),
+    rateLimitIpBurst: parseInteger(env.RATE_LIMIT_IP_BURST, 0, true),
+    rateLimitUserPerMinute: parseInteger(env.RATE_LIMIT_USER_PER_MINUTE, 1000),
+    rateLimitUserBurst: parseInteger(env.RATE_LIMIT_USER_BURST, 0, true),
     rateLimitPremiumTiers: (env.RATE_LIMIT_PREMIUM_TIERS ?? "premium,enterprise")
       .split(",")
       .map((entry) => entry.trim().toLowerCase())
@@ -424,7 +432,13 @@ export function loadConfig(env = process.env) {
     ddosCaptchaUrl: env.DDOS_CAPTCHA_URL ?? "https://challenges.cloudflare.com/turnstile/v0/siteverify",
     ddosBlockedRegions: parseList(env.DDOS_BLOCKED_REGIONS, []),
     redisUrl: env.REDIS_URL ?? "",
-    didCacheTtlMs: parseInteger(env.DID_CACHE_TTL_MS, 60 * 1000),
+    didCacheTtlMs: parseInteger(
+      env.DID_CACHE_TTL_MS ??
+        (env.DID_CACHE_TTL_SECONDS
+          ? Number(env.DID_CACHE_TTL_SECONDS) * 1000
+          : undefined),
+      60 * 1000,
+    ),
     redisMaxRetries: parseInteger(env.REDIS_MAX_RETRIES, 5),
     redisRetryBaseMs: parseInteger(env.REDIS_RETRY_BASE_MS, 200),
     redisCommandTimeoutMs: parseInteger(env.REDIS_COMMAND_TIMEOUT_MS, 1000),

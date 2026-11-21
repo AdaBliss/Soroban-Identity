@@ -50,7 +50,6 @@ import ErrorBoundary from "./components/ErrorBoundary";
 import Toast from "./components/Toast";
 import { ToastProvider } from "./context/ToastContext";
 import { useWallet } from "./hooks/useWallet";
-import { useIdleSessionTimeout } from "./hooks/useIdleSessionTimeout";
 import { useCredentialExpiryCheck } from "./hooks/useCredentialExpiryCheck";
 import { useTheme, cycleTheme, getThemeIcon, getThemeLabel } from "./hooks/useTheme";
 import { useServiceWorker } from "./hooks/useServiceWorker";
@@ -110,7 +109,6 @@ function AppContent() {
   const [activeCredentialId, setActiveCredentialId] = useState<string | null>(null);
   const networkConfig = NETWORK_CONFIGS[activeNetwork];
   const wallet = useWallet(networkConfig);
-  useIdleSessionTimeout(wallet.connected, wallet.disconnect);
   const [theme, setTheme, isDarkMode] = useTheme();
   const { t, i18n } = useTranslation();
   const [isConnected, setIsConnected] = useState<boolean | null>(null);

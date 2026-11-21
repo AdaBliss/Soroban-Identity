@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import { logger } from './logger.js';
 import { decryptRequestJson, encryptSensitiveFields } from './payload-encryption.js';
 import { getClientAddress, isAdminIpAllowed } from './ip-whitelist.js';
+import { isJwtToken, verifyJwt } from './jwt-auth.js';
 
 /**
  * Constant-time string comparison using crypto.timingSafeEqual.
@@ -519,6 +520,40 @@ export async function requireAuth(req, res, config, requiredScopes = []) {
       message: "Missing API key"
     });
     return false;
+  }
+
+  // Signed JWTs are issuer credentials. Bind the Stellar public-key subject to
+  // the request so handlers and rate limiting never trust client headers.
+  if (isJwtToken(token)) {
+    const verdict = verifyJwt(token, {
+      secret: config.jwtSecret,
+      publicKey: config.jwtPublicKey,
+      algorithms: config.jwtAlgorithms,
+      issuer: config.jwtIssuer,
+      audience: config.jwtAudience,
+      clockSkewSeconds: config.jwtClockSkewSeconds ?? 30,
+    });
+    if (!verdict.ok) {
+      sendJson(res, verdict.code === 'JWT_NOT_CONFIGURED' ? 503 : 401, {
+        error: 'unauthorized', code: verdict.code, message: verdict.message,
+      });
+      return false;
+    }
+    req.userId = verdict.auth.subject;
+    req.issuer = verdict.auth.subject;
+    req.apiKeyScopes = verdict.auth.scopes.length > 0 ? verdict.auth.scopes : ['*'];
+    req.userTier = 'issuer';
+    req.auth = { jwt: verdict.auth, claims: verdict.claims };
+    if (requiredScopes.length > 0) {
+      const hasWildcard = req.apiKeyScopes.includes('*');
+      const hasAllScopes = requiredScopes.every((required) => hasWildcard || req.apiKeyScopes.includes(required));
+      if (!hasAllScopes) {
+        const missingScopes = requiredScopes.filter((scope) => !req.apiKeyScopes.includes(scope));
+        sendJson(res, 403, { error: 'forbidden', code: 'INSUFFICIENT_SCOPE', requiredScopes, missingScopes });
+        return false;
+      }
+    }
+    return true;
   }
 
   // 1. Try validating with ApiKeyService if available

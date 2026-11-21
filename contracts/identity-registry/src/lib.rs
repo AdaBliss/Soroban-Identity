@@ -64,6 +64,8 @@ pub enum ContractError {
     ResolverPluginError = 29,
     /// The fallback chain is empty or exceeds the maximum supported length.
     InvalidFallbackChain = 30,
+    /// An existing IPFS CID cannot be changed or removed.
+    CidImmutable = 31,
 }
 
 /// Version returned by `ping` for deployment health checks.
@@ -151,6 +153,27 @@ pub struct DidDocument {
     /// Parent controller. A root DID stores its own controller here.
     pub parent: Address,
     pub delegation_depth: u32,
+}
+
+/// On-chain DID document record stored by the registry interface
+/// ([`IdentityRegistry::create_identity`] / [`IdentityRegistry::resolve_identity`]).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DidRecord {
+    /// The full DID string, e.g. `did:stellar:<address>`.
+    pub did: String,
+    /// The address that owns (controls) the DID.
+    pub owner: Address,
+    /// Hash of the current DID document metadata.
+    pub metadata_hash: BytesN<32>,
+    /// Ledger timestamp at registration.
+    pub created_at: u64,
+    /// Ledger timestamp of the last update.
+    pub updated_at: u64,
+    /// Monotonically increasing record version, starting at 1.
+    pub version: u32,
+    /// Whether the DID is active.
+    pub active: bool,
 }
 
 #[contracttype]
@@ -399,6 +422,7 @@ impl IdentityRegistry {
         if !doc.active {
             return Err(ContractError::DidDeactivated);
         }
+        Self::ensure_cid_immutable(&env, &doc.metadata, &metadata)?;
         doc.metadata = metadata;
         doc.updated_at = env.ledger().timestamp();
         storage.set(&key, &doc);
@@ -487,7 +511,7 @@ impl IdentityRegistry {
                 if !doc.active {
                     return Err(ContractError::DidDeactivated);
                 }
-                
+                Self::ensure_cid_immutable(&env, &doc.metadata, &metadata)?;
                 Ok(())
             })();
             
@@ -514,7 +538,7 @@ impl IdentityRegistry {
                 doc.updated_at = now;
                 
                 storage.set(&key, &doc);
-                storage.extend_ttl(&key, TTL_LEDGERS, TTL_LEDGERS);
+                storage.extend_ttl(&key, TTL_BUMP_THRESHOLD, TTL_LEDGERS);
                 
                 // Emit update event with metadata hash
                 let mut hash_input = Self::string_to_bytes(&env, &doc.id);
@@ -623,6 +647,132 @@ impl IdentityRegistry {
             return Err(ContractError::DidDeactivated);
         }
         Ok(doc)
+    }
+
+    // ── DID registry interface (#1265 / #1266 / #1267) ────────────────────────
+
+    /// Registers a new DID owned by `owner` and stores the initial metadata hash.
+    ///
+    /// The DID string must be non-empty and use a supported method prefix
+    /// (`did:stellar:`). The owner must sign the transaction. A DID that is
+    /// already registered returns [`ContractError::DidAlreadyExists`].
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `owner` - The address that owns (controls) the DID (must sign).
+    /// * `did` - The DID string to register, e.g. `did:stellar:<address>`.
+    /// * `metadata_hash` - Hash of the initial DID document metadata.
+    ///
+    /// # Returns
+    /// The registered DID string.
+    ///
+    /// # Errors
+    /// Returns [`ContractError::ContractPaused`] if the contract is paused.
+    /// Returns [`ContractError::InvalidDid`] if `did` is empty or malformed.
+    /// Returns [`ContractError::UnsupportedDidMethod`] if the method is not `stellar`.
+    /// Returns [`ContractError::DidAlreadyExists`] if the DID is already registered.
+    pub fn create_identity(
+        env: Env,
+        owner: Address,
+        did: String,
+        metadata_hash: BytesN<32>,
+    ) -> Result<String, ContractError> {
+        owner.require_auth();
+        Self::require_not_paused(&env)?;
+        Self::validate_identity_did(&env, &did)?;
+
+        let storage = env.storage().persistent();
+        let key = Self::identity_key(&env, &did);
+        if storage.has(&key) {
+            return Err(ContractError::DidAlreadyExists);
+        }
+
+        let now = env.ledger().timestamp();
+        let record = DidRecord {
+            did: did.clone(),
+            owner: owner.clone(),
+            metadata_hash: metadata_hash.clone(),
+            created_at: now,
+            updated_at: now,
+            version: 1,
+            active: true,
+        };
+        storage.set(&key, &record);
+        storage.extend_ttl(&key, TTL_BUMP_THRESHOLD, TTL_LEDGERS);
+
+        env.events().publish(
+            (IDENTITY, symbol_short!("did_crtd")),
+            (EVENT_VERSION, owner, did.clone(), metadata_hash, now),
+        );
+        Ok(did)
+    }
+
+    /// Updates the metadata hash of an existing, active DID. Only the owner can
+    /// call this and must sign the transaction.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `owner` - The DID owner (must sign).
+    /// * `did` - The DID string to update.
+    /// * `metadata_hash` - The new metadata hash.
+    ///
+    /// # Errors
+    /// Returns [`ContractError::ContractPaused`] if the contract is paused.
+    /// Returns [`ContractError::InvalidDid`] if `did` is empty or malformed.
+    /// Returns [`ContractError::DidNotFound`] if the DID is not registered.
+    /// Returns [`ContractError::DidDeactivated`] if the DID is inactive.
+    /// Returns [`ContractError::Unauthorized`] if `owner` is not the DID owner.
+    pub fn update_identity(
+        env: Env,
+        owner: Address,
+        did: String,
+        metadata_hash: BytesN<32>,
+    ) -> Result<(), ContractError> {
+        owner.require_auth();
+        Self::require_not_paused(&env)?;
+        Self::validate_identity_did(&env, &did)?;
+
+        let storage = env.storage().persistent();
+        let key = Self::identity_key(&env, &did);
+        let mut record: DidRecord = storage.get(&key).ok_or(ContractError::DidNotFound)?;
+        if !record.active {
+            return Err(ContractError::DidDeactivated);
+        }
+        if record.owner != owner {
+            return Err(ContractError::Unauthorized);
+        }
+
+        let now = env.ledger().timestamp();
+        record.metadata_hash = metadata_hash.clone();
+        record.updated_at = now;
+        record.version = record.version.saturating_add(1);
+        storage.set(&key, &record);
+        storage.extend_ttl(&key, TTL_BUMP_THRESHOLD, TTL_LEDGERS);
+
+        env.events().publish(
+            (IDENTITY, symbol_short!("did_upd")),
+            (EVENT_VERSION, owner, did, metadata_hash, now),
+        );
+        Ok(())
+    }
+
+    /// Resolves a registered DID to its full on-chain document record.
+    ///
+    /// # Errors
+    /// Returns [`ContractError::InvalidDid`] if `did` is empty or malformed.
+    /// Returns [`ContractError::DidNotFound`] if the DID is not registered.
+    pub fn resolve_identity(env: Env, did: String) -> Result<DidRecord, ContractError> {
+        Self::validate_identity_did(&env, &did)?;
+        let key = Self::identity_key(&env, &did);
+        let record: DidRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::DidNotFound)?;
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_BUMP_THRESHOLD, TTL_LEDGERS);
+        Ok(record)
     }
 
     // ── Universal DID resolver (#1127) ────────────────────────────────────────
@@ -948,6 +1098,22 @@ impl IdentityRegistry {
         Ok(did_id)
     }
 
+    fn ensure_cid_immutable(
+        env: &Env,
+        existing: &Map<String, String>,
+        updated: &Map<String, String>,
+    ) -> Result<(), ContractError> {
+        for key_name in ["cid", "ipfs_cid"] {
+            let key = String::from_str(env, key_name);
+            if let Some(old_cid) = existing.get(key.clone()) {
+                if updated.get(key) != Some(old_cid) {
+                    return Err(ContractError::CidImmutable);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn validate_metadata(metadata: &Map<String, String>) -> Result<(), ContractError> {
         if metadata.len() > 10 {
             return Err(ContractError::MetadataTooLarge);
@@ -963,6 +1129,29 @@ impl IdentityRegistry {
     fn did_key(env: &Env, controller: &Address) -> (Symbol, BytesN<32>) {
         let key_bytes = env.crypto().sha256(&controller.clone().to_xdr(env));
         (IDENTITY, key_bytes.into())
+    }
+
+    /// Storage key for a DID string registered through the registry interface.
+    fn identity_key(env: &Env, did: &String) -> (Symbol, BytesN<32>) {
+        let key_bytes = env.crypto().sha256(&Self::string_to_bytes(env, did));
+        (IDENTITY, key_bytes.into())
+    }
+
+    /// Validates that `did` is non-empty and uses the supported `did:stellar:` method.
+    fn validate_identity_did(env: &Env, did: &String) -> Result<(), ContractError> {
+        if did.is_empty() {
+            return Err(ContractError::InvalidDid);
+        }
+        let did_bytes = Self::string_to_bytes(env, did);
+        if did_bytes.len() as usize <= DID_STELLAR_PREFIX.len() {
+            return Err(ContractError::InvalidDid);
+        }
+        for (i, expected) in DID_STELLAR_PREFIX.iter().enumerate() {
+            if did_bytes.get(i as u32) != Some(*expected) {
+                return Err(ContractError::UnsupportedDidMethod);
+            }
+        }
+        Ok(())
     }
 
     fn build_did_string(env: &Env, controller: &Address) -> String {
@@ -1723,6 +1912,108 @@ mod tests {
             client.try_revoke_delegation(&parent, &child),
             Err(Ok(ContractError::DelegationRevoked))
         );
+    }
+
+    // ── DID registry interface tests (#1265 / #1266 / #1267) ─────────────────
+
+    fn sample_hash(env: &Env, seed: u8) -> BytesN<32> {
+        BytesN::from_array(env, &[seed; 32])
+    }
+
+    #[test]
+    fn test_create_identity_success() {
+        let (env, client) = setup();
+        let owner = Address::generate(&env);
+        let did = String::from_str(&env, "did:stellar:GOWNEROWNEROWNEROWNEROWNEROWNEROWNEROWNEROWNEROWNEROWNER");
+        let hash = sample_hash(&env, 7);
+
+        let returned = client.create_identity(&owner, &did, &hash);
+        assert_eq!(returned, did);
+
+        let record = client.resolve_identity(&did);
+        assert_eq!(record.did, did);
+        assert_eq!(record.owner, owner);
+        assert_eq!(record.metadata_hash, hash);
+        assert!(record.active);
+        assert_eq!(record.version, 1);
+        assert_eq!(record.created_at, record.updated_at);
+    }
+
+    #[test]
+    fn test_create_identity_rejects_duplicate() {
+        let (env, client) = setup();
+        let owner = Address::generate(&env);
+        let did = String::from_str(&env, "did:stellar:GOWNEROWNEROWNEROWNEROWNEROWNEROWNEROWNEROWNEROWNEROWNER");
+        client.create_identity(&owner, &did, &sample_hash(&env, 1));
+
+        let result = client.try_create_identity(&owner, &did, &sample_hash(&env, 2));
+        assert_eq!(result, Err(Ok(ContractError::DidAlreadyExists)));
+    }
+
+    #[test]
+    fn test_create_identity_rejects_empty_did() {
+        let (env, client) = setup();
+        let owner = Address::generate(&env);
+        let did = String::from_str(&env, "");
+        let result = client.try_create_identity(&owner, &did, &sample_hash(&env, 1));
+        assert_eq!(result, Err(Ok(ContractError::InvalidDid)));
+    }
+
+    #[test]
+    fn test_resolve_identity_found() {
+        let (env, client) = setup();
+        let owner = Address::generate(&env);
+        let did = String::from_str(&env, "did:stellar:GOWNEROWNEROWNEROWNEROWNEROWNEROWNEROWNEROWNEROWNEROWNER");
+        let hash = sample_hash(&env, 3);
+        client.create_identity(&owner, &did, &hash);
+
+        let record = client.resolve_identity(&did);
+        assert_eq!(record.owner, owner);
+        assert_eq!(record.metadata_hash, hash);
+    }
+
+    #[test]
+    fn test_resolve_identity_not_found() {
+        let (env, client) = setup();
+        let did = String::from_str(&env, "did:stellar:GMISSINGMISSINGMISSINGMISSINGMISSINGMISSINGMISSINGMISSING");
+        let result = client.try_resolve_identity(&did);
+        assert_eq!(result, Err(Ok(ContractError::DidNotFound)));
+    }
+
+    #[test]
+    fn test_update_identity_success() {
+        let (env, client) = setup();
+        let owner = Address::generate(&env);
+        let did = String::from_str(&env, "did:stellar:GOWNEROWNEROWNEROWNEROWNEROWNEROWNEROWNEROWNEROWNEROWNER");
+        client.create_identity(&owner, &did, &sample_hash(&env, 1));
+
+        let new_hash = sample_hash(&env, 9);
+        client.update_identity(&owner, &did, &new_hash);
+
+        let record = client.resolve_identity(&did);
+        assert_eq!(record.metadata_hash, new_hash);
+        assert_eq!(record.version, 2);
+    }
+
+    #[test]
+    fn test_update_identity_unauthorized_owner() {
+        let (env, client) = setup();
+        let owner = Address::generate(&env);
+        let attacker = Address::generate(&env);
+        let did = String::from_str(&env, "did:stellar:GOWNEROWNEROWNEROWNEROWNEROWNEROWNEROWNEROWNEROWNEROWNER");
+        client.create_identity(&owner, &did, &sample_hash(&env, 1));
+
+        let result = client.try_update_identity(&attacker, &did, &sample_hash(&env, 2));
+        assert_eq!(result, Err(Ok(ContractError::Unauthorized)));
+    }
+
+    #[test]
+    fn test_update_identity_not_found() {
+        let (env, client) = setup();
+        let owner = Address::generate(&env);
+        let did = String::from_str(&env, "did:stellar:GMISSINGMISSINGMISSINGMISSINGMISSINGMISSINGMISSINGMISSING");
+        let result = client.try_update_identity(&owner, &did, &sample_hash(&env, 2));
+        assert_eq!(result, Err(Ok(ContractError::DidNotFound)));
     }
 
     /// #866: an access only extends the TTL once it has dropped below
