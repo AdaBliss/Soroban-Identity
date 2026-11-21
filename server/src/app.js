@@ -252,6 +252,7 @@ export function createApp({
   // the DID cache already owns a connected client, so reuse it unless a
   // caller (or a test) supplies one explicitly.
   redisClient = didCache?.client ?? null,
+  dbClient = null,
   webhookService = new WebhookDeliveryService(config),
   apiKeyService = new ApiKeyService(config),
   oauthService = new OAuthService(config),
@@ -1114,6 +1115,7 @@ export function createApp({
             config,
             soroban,
             redisClient,
+            dbClient,
             version: SERVER_VERSION,
           });
 
@@ -1144,6 +1146,7 @@ export function createApp({
             config,
             soroban,
             redisClient,
+            dbClient,
             version: SERVER_VERSION,
           });
           return sendJson(res, readiness.ready ? 200 : 503, readiness);

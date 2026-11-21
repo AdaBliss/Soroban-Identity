@@ -394,6 +394,7 @@ export function loadConfig(env = process.env) {
     vcProofPrivateKey: env.VC_PROOF_PRIVATE_KEY ?? "",
     // Defaults to "<issuer DID>#key-1" when unset.
     vcProofVerificationMethod: env.VC_PROOF_VERIFICATION_METHOD ?? "",
+    databaseUrl: env.DATABASE_URL ?? "",
     dataDir: env.DATA_DIR ? path.resolve(env.DATA_DIR) : DEFAULT_DATA_DIR,
     auditLogPath: env.AUDIT_LOG_PATH
       ? path.resolve(env.AUDIT_LOG_PATH)
