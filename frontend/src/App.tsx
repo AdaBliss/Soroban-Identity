@@ -61,10 +61,11 @@ import { useServiceWorker } from "./hooks/useServiceWorker";
 import { useInstallPrompt } from "./hooks/useInstallPrompt";
 import OfflineIndicator from "./components/OfflineIndicator";
 import {
-  DEFAULT_NETWORK,
   NETWORK_CONFIGS,
   NETWORK_OPTIONS,
+  getActiveNetwork,
   isMainnet,
+  persistActiveNetwork,
   type NetworkName,
 } from "./network";
 import { checkConnection, IdentityClient, CredentialClient, ReputationClient } from "../../sdk/src/index";
@@ -174,7 +175,7 @@ function InstallPromptBanner() {
 function AppContent() {
   const [tab, setTab] = useState<Tab>(Tab.Identity);
   const tabRefs = useRef<Partial<Record<Tab, HTMLButtonElement | null>>>({});
-  const [activeNetwork, setActiveNetwork] = useState<NetworkName>(DEFAULT_NETWORK);
+  const [activeNetwork, setActiveNetwork] = useState<NetworkName>(getActiveNetwork);
   const [verifyId, setVerifyId] = useState<string | null>(null);
   const [scanning, setScanning] = useState(false);
   const [deepLinkEncrypted, setDeepLinkEncrypted] = useState<{ c: string; k: string } | null>(null);
@@ -183,6 +184,9 @@ function AppContent() {
   // Credential currently open for collaborative editing (#1105).
   const [activeCredentialId, setActiveCredentialId] = useState<string | null>(null);
   const networkConfig = NETWORK_CONFIGS[activeNetwork];
+  useEffect(() => {
+    persistActiveNetwork(activeNetwork);
+  }, [activeNetwork]);
   const wallet = useWallet(networkConfig);
   const [theme, setTheme, isDarkMode] = useTheme();
   const { t, i18n } = useTranslation();

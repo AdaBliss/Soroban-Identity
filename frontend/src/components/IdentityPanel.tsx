@@ -21,6 +21,7 @@ import { RecoveryPhraseBackup } from './RecoveryPhraseBackup';
 import { ProfilePictureUpload } from './ProfilePictureUpload';
 import { IdentityClient, ReputationClient } from '../../../sdk/src';
 import { getNetworkConfig } from '../network';
+import { copyToClipboard } from '../utils/clipboard';
 
 type IdentityState =
   | { status: 'idle' }
@@ -267,27 +268,10 @@ export default function IdentityPanel({ wallet: propWallet }: { wallet?: any } =
   const handleCopyDid = async () => {
     if (!resolvedAddress) return;
     const did = `did:stellar:${resolvedAddress}`;
-    
-    try {
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        await navigator.clipboard.writeText(did);
-        setCopied(true);
-        setTimeout(() => setCopied(false), 2000);
-      } else {
-        // Fallback for browsers without clipboard API
-        const textarea = document.createElement('textarea');
-        textarea.value = did;
-        textarea.style.position = 'fixed';
-        textarea.style.opacity = '0';
-        document.body.appendChild(textarea);
-        textarea.select();
-        document.execCommand('copy');
-        document.body.removeChild(textarea);
-        setCopied(true);
-        setTimeout(() => setCopied(false), 2000);
-      }
-    } catch (err) {
-      console.error('Failed to copy DID:', err);
+    const copiedSuccessfully = await copyToClipboard(did);
+    if (copiedSuccessfully) {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
     }
   };
 
