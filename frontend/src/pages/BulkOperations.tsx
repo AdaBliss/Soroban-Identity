@@ -276,6 +276,12 @@ export const BulkOperations: React.FC = () => {
       return;
     }
 
+    if (!isDryRun && !isIssuance) {
+      const confirmed = window.confirm(
+        `Revoke ${validItems.length} credential${validItems.length === 1 ? "" : "s"}? This action cannot be undone.`,
+      );
+      if (!confirmed) return;
+    }
     if (isDryRun) {
       // Dry-run simulation
       setExecutionLog((prev) => [

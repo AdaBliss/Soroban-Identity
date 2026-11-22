@@ -153,7 +153,10 @@ const ActivityFeed: React.FC = () => {
     );
 
     observer.observe(sentinel);
-    return () => observer.disconnect();
+    return () => {
+      observer.disconnect();
+      isLoadingRef.current = false;
+    };
   }, [hasMore, loading, loadMore]);
 
   const handleExportCsv = useCallback(() => {

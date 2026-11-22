@@ -24,6 +24,8 @@ const NetworkStatistics = lazy(() => import("./components/NetworkStatistics"));
 const ActivityFeed = lazy(() => import("./components/ActivityFeed"));
 const CustomizableDashboard = lazy(() => import("./components/CustomizableDashboard"));
 const PrivacySettings = lazy(() => import("./components/privacy/PrivacySettings"));
+const BiometricDeviceManager = lazy(() => import("./components/BiometricDeviceManager"));
+const NotificationPreferences = lazy(() => import("./components/NotificationPreferences"));
 const { isShareLinkExpired } = await import("./components/privacy/shareLinks");
 
 const preloadCredentialsPanel = () => {
@@ -44,6 +46,9 @@ const preloadCustomizableDashboard = () => {
 const preloadPrivacySettings = () => {
   void import("./components/privacy/PrivacySettings");
 };
+const preloadBiometricDeviceManager = () => {
+  void import("./components/BiometricDeviceManager");
+};
 import WalletButton from "./components/WalletButton";
 import QRScanner from "./components/QRScanner";
 import { TourProvider, useTour } from "./context/TourContext";
@@ -58,10 +63,11 @@ import { useServiceWorker } from "./hooks/useServiceWorker";
 import { useInstallPrompt } from "./hooks/useInstallPrompt";
 import OfflineIndicator from "./components/OfflineIndicator";
 import {
-  DEFAULT_NETWORK,
   NETWORK_CONFIGS,
   NETWORK_OPTIONS,
+  getActiveNetwork,
   isMainnet,
+  persistActiveNetwork,
   type NetworkName,
 } from "./network";
 import { checkConnection, IdentityClient, CredentialClient, ReputationClient } from "../../sdk/src/index";
@@ -86,7 +92,7 @@ export enum Tab {
   CredentialAnalytics = "credentialAnalytics",
   Dashboard = "dashboard",
   Privacy = "privacy",
-  Admin = "admin",
+  ConnectedAccounts = "connectedAccounts",
 }
 
 const TAB_ORDER: Tab[] = [
@@ -98,7 +104,7 @@ const TAB_ORDER: Tab[] = [
   Tab.CredentialAnalytics,
   Tab.Dashboard,
   Tab.Privacy,
-  Tab.Admin,
+  Tab.ConnectedAccounts,
 ];
 
 // #1264: dismissible mobile install banner. Hidden when the app is already
@@ -173,7 +179,7 @@ function InstallPromptBanner() {
 function AppContent() {
   const [tab, setTab] = useState<Tab>(Tab.Identity);
   const tabRefs = useRef<Partial<Record<Tab, HTMLButtonElement | null>>>({});
-  const [activeNetwork, setActiveNetwork] = useState<NetworkName>(DEFAULT_NETWORK);
+  const [activeNetwork, setActiveNetwork] = useState<NetworkName>(getActiveNetwork);
   const [verifyId, setVerifyId] = useState<string | null>(null);
   const [scanning, setScanning] = useState(false);
   const [deepLinkEncrypted, setDeepLinkEncrypted] = useState<{ c: string; k: string } | null>(null);
@@ -182,6 +188,9 @@ function AppContent() {
   // Credential currently open for collaborative editing (#1105).
   const [activeCredentialId, setActiveCredentialId] = useState<string | null>(null);
   const networkConfig = NETWORK_CONFIGS[activeNetwork];
+  useEffect(() => {
+    persistActiveNetwork(activeNetwork);
+  }, [activeNetwork]);
   const wallet = useWallet(networkConfig);
   const [theme, setTheme, isDarkMode] = useTheme();
   const { t, i18n } = useTranslation();
@@ -636,6 +645,7 @@ function AppContent() {
         >
           <Suspense fallback={<LoadingFallback />}>
             <BiometricDeviceManager />
+            <NotificationPreferences />
           </Suspense>
         </section>
       )}
@@ -823,6 +833,14 @@ function AppContent() {
         <ErrorBoundary>
           <Suspense fallback={<LoadingFallback />}>
           <ViewTransition viewKey={tab}>
+          <div
+            id={`panel-${Tab.ConnectedAccounts}`}
+            role="tabpanel"
+            aria-labelledby={`tab-${Tab.ConnectedAccounts}`}
+            hidden={tab !== Tab.ConnectedAccounts}
+          >
+            {tab === Tab.ConnectedAccounts && <ConnectedAccountsPanel wallet={wallet} />}
+          </div>
           <div
             id={`panel-${Tab.Identity}`}
             role="tabpanel"

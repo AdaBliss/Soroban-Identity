@@ -88,6 +88,7 @@ const ADMIN: Symbol = symbol_short!("ADMIN");
 const PENDING_ADMIN: Symbol = symbol_short!("PADMIN");
 const DID_COUNT: Symbol = symbol_short!("DIDCNT");
 const TOTAL_DIDS: Symbol = symbol_short!("TOTDIDS");
+const DID_INDEX: Symbol = symbol_short!("DIDIDX");
 const PAUSED: Symbol = symbol_short!("PAUSED");
 /// Stored schema version, bumped by the admin-only `upgrade` entrypoint.
 const SCHEMA_VERSION: Symbol = symbol_short!("SCHEMAV");
@@ -998,6 +999,30 @@ impl IdentityRegistry {
         env.storage().instance().get(&DID_COUNT).unwrap_or(0)
     }
 
+    /// List DID documents using a stable, offset-based index.
+    ///
+    /// Inactive documents remain in the index so administrative consumers can
+    /// search and filter the complete registry. Reads are capped at 100 items
+    /// per call to keep simulations within Soroban resource limits.
+    pub fn list_dids(env: Env, offset: u32, limit: u32) -> Vec<DidDocument> {
+        let total: u32 = env.storage().instance().get(&TOTAL_DIDS).unwrap_or(0);
+        let end = core::cmp::min(total, offset.saturating_add(limit.min(100)));
+        let storage = env.storage().persistent();
+        let mut result = Vec::new(&env);
+
+        for index in offset..end {
+            let index_key = (DID_INDEX, index);
+            let Some(controller) = storage.get::<_, Address>(&index_key) else {
+                continue;
+            };
+            storage.extend_ttl(&index_key, TTL_BUMP_THRESHOLD, TTL_LEDGERS);
+            if let Some(document) = storage.get::<_, DidDocument>(&Self::did_key(&env, &controller)) {
+                result.push_back(document);
+            }
+        }
+        result
+    }
+
     pub fn get_storage_stats(env: Env) -> IdentityStorageStats {
         IdentityStorageStats {
             total_dids: env.storage().instance().get(&TOTAL_DIDS).unwrap_or(0),
@@ -1242,6 +1267,9 @@ impl IdentityRegistry {
         let count: u32 = env.storage().instance().get(&DID_COUNT).unwrap_or(0);
         env.storage().instance().set(&DID_COUNT, &(count + 1));
         let total: u32 = env.storage().instance().get(&TOTAL_DIDS).unwrap_or(0);
+        let index_key = (DID_INDEX, total);
+        storage.set(&index_key, &controller);
+        storage.extend_ttl(&index_key, TTL_BUMP_THRESHOLD, TTL_LEDGERS);
         env.storage().instance().set(&TOTAL_DIDS, &(total + 1));
         env.events().publish((IDENTITY, symbol_short!("created")), (EVENT_VERSION, controller.clone(), now));
         Ok(did_id)

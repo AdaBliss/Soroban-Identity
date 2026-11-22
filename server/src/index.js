@@ -171,6 +171,19 @@ if (config.accessLogEnabled && config.accessLogPath) {
   });
 }
 
+// Identity and attestation REST endpoints (#1273-#1276). The router is built
+// with the same shared services as the rest of the app so authentication,
+// rate limiting, access logging, metrics and error handling behave uniformly.
+const identityRouter = createIdentityRouter({
+  config,
+  soroban,
+  metrics,
+  didCache,
+  apiKeyService,
+  webhookService,
+  realtime,
+});
+
 let dbPool = null;
 if (config.databaseUrl) {
   const { default: pg } = await import('pg');
@@ -192,6 +205,7 @@ const server = http.createServer(
     accessLogSink,
     realtime,
     ddosProtection,
+    identityRouter,
   }),
 );
 
