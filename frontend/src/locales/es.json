@@ -11,6 +11,7 @@
     "identity": "Identidad (DID)",
     "credentials": "Credenciales",
     "issuerAnalytics": "Analíticas del Emisor",
+    "admin": "Administración",
     "label": "Secciones"
   },
   "wallet": {

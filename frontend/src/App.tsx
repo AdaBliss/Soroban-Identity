@@ -6,6 +6,8 @@ import KeyboardShortcutsModal from "./components/KeyboardShortcutsModal";
 import { useKeyboardShortcuts, useSequentialShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useKeyboardShortcutsContext } from "./context/KeyboardShortcutsContext";
 import ViewTransition from "./components/ViewTransition";
+import ContractStatusIndicator from "./components/ContractStatusIndicator";
+import AdminIdentityTable from "./components/AdminIdentityTable";
 import VoiceCommandButton from "./components/VoiceCommandButton";
 import { useVoiceCommands, type VoiceCommand } from "./hooks/useVoiceCommands";
 import { CollaborationProvider } from "./collaboration/CollaborationProvider";
@@ -84,6 +86,7 @@ export enum Tab {
   CredentialAnalytics = "credentialAnalytics",
   Dashboard = "dashboard",
   Privacy = "privacy",
+  Admin = "admin",
 }
 
 const TAB_ORDER: Tab[] = [
@@ -95,6 +98,7 @@ const TAB_ORDER: Tab[] = [
   Tab.CredentialAnalytics,
   Tab.Dashboard,
   Tab.Privacy,
+  Tab.Admin,
 ];
 
 // #1264: dismissible mobile install banner. Hidden when the app is already
@@ -545,6 +549,7 @@ function AppContent() {
               {isConnected ? t("app.networkOnline") : t("app.networkOffline")}
             </div>
           )}
+          <ContractStatusIndicator />
           <select
             value={i18n.language}
             onChange={handleLocaleChange}
@@ -970,6 +975,15 @@ function AppContent() {
             hidden={tab !== Tab.ActivityFeed}
           >
             {tab === Tab.ActivityFeed && <ActivityFeed />}
+          </div>
+          <div
+            id={`panel-${Tab.Admin}`}
+            role="tabpanel"
+            aria-labelledby={`tab-${Tab.Admin}`}
+            data-tour="panel-admin"
+            hidden={tab !== Tab.Admin}
+          >
+            {tab === Tab.Admin && <AdminIdentityTable />}
           </div>
           </ViewTransition>
           </Suspense>

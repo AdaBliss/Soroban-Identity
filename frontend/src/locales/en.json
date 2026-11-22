@@ -13,6 +13,7 @@
     "issuerAnalytics": "Issuer Analytics",
     "networkStatistics": "Network Statistics",
     "activityFeed": "Activity Feed",
+    "admin": "Admin",
     "label": "Sections"
   },
   "networkStatistics": {

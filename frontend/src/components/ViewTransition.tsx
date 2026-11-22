@@ -1,5 +1,6 @@
-import React, { useEffect, useState } from "react";
-import "../styles/transitions.css";
+import React from 'react';
+import { motion, useReducedMotion } from 'framer-motion';
+import '../styles/transitions.css';
 
 export interface ViewTransitionProps {
   viewKey: string;
@@ -7,50 +8,31 @@ export interface ViewTransitionProps {
   className?: string;
 }
 
-export default function ViewTransition({
-  viewKey,
-  children,
-  className = "",
-}: ViewTransitionProps) {
-  const [currentKey, setCurrentKey] = useState(viewKey);
-  const [isTransitioning, setIsTransitioning] = useState(false);
-  const [prefersReducedMotion, setPrefersReducedMotion] = useState(false);
+const FADE_SLIDE = {
+  initial: { opacity: 0, y: 12 },
+  enter: { opacity: 1, y: 0 },
+};
 
-  useEffect(() => {
-    if (typeof window !== "undefined" && window.matchMedia) {
-      const mediaQuery = window.matchMedia("(prefers-reduced-motion: reduce)");
-      setPrefersReducedMotion(mediaQuery.matches);
-      const handler = (e: MediaQueryListEvent) => setPrefersReducedMotion(e.matches);
-      mediaQuery.addEventListener("change", handler);
-      return () => mediaQuery.removeEventListener("change", handler);
-    }
-  }, []);
-
-  useEffect(() => {
-    if (viewKey !== currentKey) {
-      if (prefersReducedMotion) {
-        setCurrentKey(viewKey);
-      } else {
-        setIsTransitioning(true);
-        const timeout = setTimeout(() => {
-          setCurrentKey(viewKey);
-          setIsTransitioning(false);
-        }, 120);
-        return () => clearTimeout(timeout);
-      }
-    }
-  }, [viewKey, currentKey, prefersReducedMotion]);
+/**
+ * Animates route-like tab changes with a Framer Motion fade/slide. Keying the
+ * element by `viewKey` remounts it on navigation so the enter animation runs
+ * for each new view. Users who prefer reduced motion get an instant swap.
+ */
+export default function ViewTransition({ viewKey, children, className = '' }: ViewTransitionProps) {
+  const prefersReducedMotion = useReducedMotion();
 
   return (
-    <div
-      className={`view-transition-container ${
-        isTransitioning ? "view-transition-exit" : "view-transition-enter"
-      } ${className}`}
-      data-view-key={currentKey}
+    <motion.div
+      key={viewKey}
+      data-view-key={viewKey}
       data-testid="view-transition-wrapper"
+      className={['view-transition-container', className].filter(Boolean).join(' ')}
+      initial={prefersReducedMotion ? false : 'initial'}
+      animate={prefersReducedMotion ? undefined : 'enter'}
+      variants={FADE_SLIDE}
+      transition={{ duration: 0.22, ease: [0.16, 1, 0.3, 1] }}
     >
       {children}
-    </div>
+    </motion.div>
   );
 }
-</｜｜DSML｜｜ parameter>

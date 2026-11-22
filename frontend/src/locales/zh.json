@@ -11,6 +11,7 @@
     "identity": "身份 (DID)",
     "credentials": "凭证",
     "issuerAnalytics": "发证方分析",
+    "admin": "管理",
     "label": "导航"
   },
   "wallet": {

@@ -11,6 +11,7 @@
     "identity": "Identité (DID)",
     "credentials": "Justificatifs",
     "issuerAnalytics": "Analytique de l'émetteur",
+    "admin": "Administration",
     "label": "Sections"
   },
   "wallet": {

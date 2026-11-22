@@ -24,6 +24,7 @@
     "@stellar/stellar-sdk": "^12.0.0",
     "@walletconnect/sign-client": "^2.17.0",
     "date-fns": "^4.4.0",
+    "framer-motion": "^14.14.0",
     "i18next": "^26.0.7",
     "jspdf": "^2.5.2",
     "jszip": "^3.10.1",
