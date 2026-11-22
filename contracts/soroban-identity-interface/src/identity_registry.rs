@@ -88,6 +88,8 @@ pub trait IdentityRegistryInterface {
 
     fn get_did_count(env: Env) -> u32;
 
+    fn list_dids(env: Env, offset: u32, limit: u32) -> Vec<DidDocument>;
+
     fn get_storage_stats(env: Env) -> IdentityStorageStats;
 
     fn remove_service(
@@ -269,6 +271,10 @@ impl IdentityRegistryInterface for IdentityRegistry {
 
     fn get_did_count(env: Env) -> u32 {
         Self::get_did_count(env)
+    }
+
+    fn list_dids(env: Env, offset: u32, limit: u32) -> Vec<DidDocument> {
+        Self::list_dids(env, offset, limit)
     }
 
     fn get_storage_stats(env: Env) -> IdentityStorageStats {

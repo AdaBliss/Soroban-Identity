@@ -9,6 +9,7 @@ import { useAddressHistory } from '../hooks/useAddressHistory';
 import SkeletonCard from './SkeletonCard';
 import FormField from './FormField';
 import ReputationChart from './ReputationChart';
+import IdentityDirectory from './IdentityDirectory';
 import { formatTimestamp } from '../utils/formatDate';
 import { handleError, isNetworkError } from '../utils/handleError';
 import { useWalletContext } from '../context/WalletContext';
@@ -1016,6 +1017,13 @@ export default function IdentityPanel({ wallet: propWallet }: { wallet?: any } =
         )}
       </div>
 
+      <IdentityDirectory
+        wallet={wallet}
+        onSelectIdentity={(controller) => {
+          setResolveAddress(controller);
+          void handleResolve(controller);
+        }}
+      />
       <div className="card">
         <h2>Create DID</h2>
         {wallet.connected && wallet.publicKey ? (
