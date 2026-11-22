@@ -1083,6 +1083,10 @@ export default function CredentialsPanel({ verifyId, wallet: propWallet }: { ver
 
   const handleRevoke = async () => {
     if (!wallet.connected || !revokeId.trim()) return;
+    const confirmed = window.confirm(
+      `Revoke credential ${revokeId.trim()}? This action cannot be undone.`,
+    );
+    if (!confirmed) return;
     // #1303: guard against duplicate submissions (synchronous ref check so
     // rapid double-clicks can't slip through before React re-renders).
     if (revokingRef.current) return;
