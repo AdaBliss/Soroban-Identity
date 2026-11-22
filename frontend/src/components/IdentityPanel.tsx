@@ -14,7 +14,11 @@ import { handleError, isNetworkError } from '../utils/handleError';
 import { useWalletContext } from '../context/WalletContext';
 import { useToast } from '../context/ToastContext';
 import { exportDidDocumentAsJsonLd } from '../../../sdk/src/serializers';
-import { SorobanRpc, TransactionBuilder, BASE_FEE, nativeToScVal, Contract } from '@stellar/stellar-sdk';
+import { nativeToScVal } from '@stellar/stellar-sdk';
+import { useSorobanInvoke } from '../hooks/useSorobanInvoke';
+import { downloadIdentityExport } from '../utils/exportIdentity';
+import { RecoveryPhraseBackup } from './RecoveryPhraseBackup';
+import { ProfilePictureUpload } from './ProfilePictureUpload';
 import { IdentityClient, ReputationClient } from '../../../sdk/src';
 import { getNetworkConfig } from '../network';
 
@@ -85,6 +89,7 @@ function validateMetadataFields(
 export default function IdentityPanel({ wallet: propWallet }: { wallet?: any } = {}) {
   const contextWallet = useWalletContext();
   const wallet = propWallet ?? contextWallet;
+  const invokeContract = useSorobanInvoke(propWallet);
   const toast = useToast();
   const [identityState, dispatch] = useReducer(identityReducer, { status: 'idle' });
   const resolving = identityState.status === 'loading';
@@ -219,6 +224,35 @@ export default function IdentityPanel({ wallet: propWallet }: { wallet?: any } =
     URL.revokeObjectURL(url);
   };
 
+  const handleExportIdentityData = () => {
+    if (!resolvedDoc || !resolvedAddress) return;
+    downloadIdentityExport({
+      did: resolvedDoc,
+      address: resolvedAddress,
+      network: getNetworkConfig().name,
+      reputation,
+      scoreHistory,
+    });
+  };
+
+  const handleAvatarLinked = async (cid: string) => {
+    if (!wallet.connected || !wallet.publicKey) {
+      throw new Error('Connect your wallet to link a profile picture.');
+    }
+    const networkConfig = getNetworkConfig();
+    await invokeContract({
+      contractId: networkConfig.identityRegistryId,
+      method: 'update_did',
+      args: [
+        nativeToScVal(wallet.publicKey, { type: 'address' }),
+        nativeToScVal(
+          { ...(resolvedDoc?.metadata ?? {}), avatar: `ipfs://${cid}` },
+          { type: 'map' }
+        ),
+      ],
+    });
+  };
+
   const handleExportJsonLd = () => {
     if (!resolvedDoc) return;
     const blob = new Blob([exportDidDocumentAsJsonLd(resolvedDoc)], { type: 'application/ld+json' });
@@ -273,43 +307,15 @@ export default function IdentityPanel({ wallet: propWallet }: { wallet?: any } =
     setCreateResult(null);
     try {
       const networkConfig = getNetworkConfig();
-      const server = new SorobanRpc.Server(typeof networkConfig.rpcUrl === 'string' ? networkConfig.rpcUrl : networkConfig.rpcUrl[0]);
-      const contract = new Contract(networkConfig.identityRegistryId);
-      const account = await server.getAccount(wallet.publicKey);
-      
-      const tx = new TransactionBuilder(account, {
-        fee: BASE_FEE,
-        networkPassphrase: networkConfig.networkPassphrase,
-      })
-        .addOperation(
-          contract.call(
-            "create_did",
-            nativeToScVal(wallet.publicKey, { type: "address" }),
-            nativeToScVal({}, { type: "map" })
-          )
-        )
-        .setTimeout(30)
-        .build();
+      const { fee: estimatedFee } = await invokeContract({
+        contractId: networkConfig.identityRegistryId,
+        method: "create_did",
+        args: [
+          nativeToScVal(wallet.publicKey, { type: "address" }),
+          nativeToScVal({}, { type: "map" }),
+        ],
+      });
 
-      const prepared = await server.prepareTransaction(tx);
-      const estimatedFee = parseInt(prepared.fee, 10);
-      const signedXdr = await wallet.signTransaction(prepared.toXDR());
-      const signedTx = TransactionBuilder.fromXDR(signedXdr, networkConfig.networkPassphrase);
-      const result = await server.sendTransaction(signedTx as any);
-      
-      if (result.status !== "PENDING") {
-        throw new Error(`Transaction failed: ${result.status}`);
-      }
-      
-      let txStatus = await server.getTransaction(result.hash);
-      while (txStatus.status === "NOT_FOUND") {
-        await new Promise(r => setTimeout(r, 2000));
-        txStatus = await server.getTransaction(result.hash);
-      }
-      if (txStatus.status === "FAILED") {
-        throw new Error("Transaction failed on-chain");
-      }
-      
       setCreateResult(
         `DID created: did:stellar:${wallet.publicKey}\nEstimated fee: ${estimatedFee} stroops (${(estimatedFee / 10_000_000).toFixed(7)} XLM)`
       );
@@ -347,41 +353,14 @@ export default function IdentityPanel({ wallet: propWallet }: { wallet?: any } =
       });
 
       const networkConfig = getNetworkConfig();
-      const server = new SorobanRpc.Server(typeof networkConfig.rpcUrl === 'string' ? networkConfig.rpcUrl : networkConfig.rpcUrl[0]);
-      const contract = new Contract(networkConfig.identityRegistryId);
-      const account = await server.getAccount(wallet.publicKey);
-
-      const tx = new TransactionBuilder(account, {
-        fee: BASE_FEE,
-        networkPassphrase: networkConfig.networkPassphrase,
-      })
-        .addOperation(
-          contract.call(
-            "update_did",
-            nativeToScVal(wallet.publicKey, { type: "address" }),
-            nativeToScVal(metadata, { type: "map" })
-          )
-        )
-        .setTimeout(30)
-        .build();
-
-      const prepared = await server.prepareTransaction(tx);
-      const signedXdr = await wallet.signTransaction(prepared.toXDR());
-      const signedTx = TransactionBuilder.fromXDR(signedXdr, networkConfig.networkPassphrase);
-      const result = await server.sendTransaction(signedTx as any);
-      
-      if (result.status !== "PENDING") {
-        throw new Error(`Transaction failed: ${result.status}`);
-      }
-      
-      let txStatus = await server.getTransaction(result.hash);
-      while (txStatus.status === "NOT_FOUND") {
-        await new Promise(r => setTimeout(r, 2000));
-        txStatus = await server.getTransaction(result.hash);
-      }
-      if (txStatus.status === "FAILED") {
-        throw new Error("Transaction failed on-chain");
-      }
+      await invokeContract({
+        contractId: networkConfig.identityRegistryId,
+        method: "update_did",
+        args: [
+          nativeToScVal(wallet.publicKey, { type: "address" }),
+          nativeToScVal(metadata, { type: "map" }),
+        ],
+      });
 
       // Wait for metadata to be indexed after transaction confirmation
       // Issue #665: Add small delay to ensure metadata is persisted on-chain
@@ -516,41 +495,14 @@ export default function IdentityPanel({ wallet: propWallet }: { wallet?: any } =
       });
 
       const networkConfig = getNetworkConfig();
-      const server = new SorobanRpc.Server(typeof networkConfig.rpcUrl === 'string' ? networkConfig.rpcUrl : networkConfig.rpcUrl[0]);
-      const contract = new Contract(networkConfig.identityRegistryId);
-      const account = await server.getAccount(wallet.publicKey);
-
-      const tx = new TransactionBuilder(account, {
-        fee: BASE_FEE,
-        networkPassphrase: networkConfig.networkPassphrase,
-      })
-        .addOperation(
-          contract.call(
-            "update_did",
-            nativeToScVal(wallet.publicKey, { type: "address" }),
-            nativeToScVal(metadata, { type: "map" })
-          )
-        )
-        .setTimeout(30)
-        .build();
-
-      const prepared = await server.prepareTransaction(tx);
-      const signedXdr = await wallet.signTransaction(prepared.toXDR());
-      const signedTx = TransactionBuilder.fromXDR(signedXdr, networkConfig.networkPassphrase);
-      const result = await server.sendTransaction(signedTx as any);
-      
-      if (result.status !== "PENDING") {
-        throw new Error(`Transaction failed: ${result.status}`);
-      }
-      
-      let txStatus = await server.getTransaction(result.hash);
-      while (txStatus.status === "NOT_FOUND") {
-        await new Promise(r => setTimeout(r, 2000));
-        txStatus = await server.getTransaction(result.hash);
-      }
-      if (txStatus.status === "FAILED") {
-        throw new Error("Transaction failed on-chain");
-      }
+      await invokeContract({
+        contractId: networkConfig.identityRegistryId,
+        method: "update_did",
+        args: [
+          nativeToScVal(wallet.publicKey, { type: "address" }),
+          nativeToScVal(metadata, { type: "map" }),
+        ],
+      });
       
       const identityClient = new IdentityClient(networkConfig);
       const updatedDid = await identityClient.resolveDid(wallet.publicKey);
@@ -802,6 +754,14 @@ export default function IdentityPanel({ wallet: propWallet }: { wallet?: any } =
               style={{ marginLeft: '0.5rem' }}
             >
               Export JSON-LD
+            </button>
+            <button
+              onClick={handleExportIdentityData}
+              disabled={!resolvedDoc || !resolvedAddress}
+              style={{ marginLeft: '0.5rem' }}
+              title="Download the full identity record, including reputation and credentials"
+            >
+              Export Identity Data
             </button>
             {!isEditingMetadata && resolvedDoc?.metadata && Object.keys(resolvedDoc.metadata).length > 0 && (
               <button
@@ -1213,6 +1173,18 @@ export default function IdentityPanel({ wallet: propWallet }: { wallet?: any } =
             Connect your wallet to update your DID metadata.
           </p>
         )}
+      </div>
+
+      <div className="card">
+        <ProfilePictureUpload
+          address={resolvedAddress ?? wallet.publicKey ?? ''}
+          currentCid={resolvedDoc?.metadata?.avatar?.replace(/^ipfs:\/\//, '') ?? null}
+          onLinked={handleAvatarLinked}
+        />
+      </div>
+
+      <div className="card">
+        <RecoveryPhraseBackup />
       </div>
     </>
   );
