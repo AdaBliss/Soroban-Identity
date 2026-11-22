@@ -90,6 +90,7 @@ export enum Tab {
   CredentialAnalytics = "credentialAnalytics",
   Dashboard = "dashboard",
   Privacy = "privacy",
+  ConnectedAccounts = "connectedAccounts",
 }
 
 const TAB_ORDER: Tab[] = [
@@ -101,6 +102,7 @@ const TAB_ORDER: Tab[] = [
   Tab.CredentialAnalytics,
   Tab.Dashboard,
   Tab.Privacy,
+  Tab.ConnectedAccounts,
 ];
 
 // #1264: dismissible mobile install banner. Hidden when the app is already
@@ -828,6 +830,14 @@ function AppContent() {
         <ErrorBoundary>
           <Suspense fallback={<LoadingFallback />}>
           <ViewTransition viewKey={tab}>
+          <div
+            id={`panel-${Tab.ConnectedAccounts}`}
+            role="tabpanel"
+            aria-labelledby={`tab-${Tab.ConnectedAccounts}`}
+            hidden={tab !== Tab.ConnectedAccounts}
+          >
+            {tab === Tab.ConnectedAccounts && <ConnectedAccountsPanel wallet={wallet} />}
+          </div>
           <div
             id={`panel-${Tab.Identity}`}
             role="tabpanel"

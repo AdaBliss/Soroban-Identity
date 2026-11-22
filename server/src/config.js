@@ -566,6 +566,16 @@ export function loadConfig(env = process.env) {
     emailApiUrl: env.EMAIL_API_URL ?? "",
     emailApiKey: env.EMAIL_API_KEY ?? "",
     emailFrom: env.EMAIL_FROM ?? "",
+    // Wallet-bound connected accounts (#1249). The independent secret is
+    // required before the challenge/session endpoints become available.
+    accountLinksSessionSecret: env.ACCOUNT_LINKS_SESSION_SECRET ?? "",
+    accountLinksStorePath: env.ACCOUNT_LINKS_STORE_PATH
+      ? path.resolve(env.ACCOUNT_LINKS_STORE_PATH)
+      : path.join(DEFAULT_DATA_DIR, "account-links.json"),
+    accountLinksAppUrl: env.ACCOUNT_LINKS_APP_URL ?? "",
+    githubClientId: env.GITHUB_CLIENT_ID ?? "",
+    githubClientSecret: env.GITHUB_CLIENT_SECRET ?? "",
+    githubRedirectUri: env.GITHUB_REDIRECT_URI ?? "",
     notificationEmail: env.NOTIFICATION_EMAIL ?? "",
     subjectNotificationEmails: parseJson(env.SUBJECT_NOTIFICATION_EMAILS, {}),
     notificationMaxRetries: parseInteger(env.NOTIFICATION_MAX_RETRIES, 3),
@@ -576,6 +586,10 @@ export function loadConfig(env = process.env) {
     stellarCli: env.STELLAR_CLI ?? "stellar",
     sourceAccount: resolveSourceAccount(env),
     network: env.STELLAR_NETWORK ?? "testnet",
+    sorobanNetworkPassphrase: env.SOROBAN_NETWORK_PASSPHRASE ??
+      ((env.STELLAR_NETWORK ?? "testnet") === "mainnet"
+        ? "Public Global Stellar Network ; September 2015"
+        : "Test SDF Network ; September 2015"),
     rpcUrl: env.STELLAR_RPC_URL ?? env.RPC_URL ?? "https://soroban-testnet.stellar.org",
     rpcCacheTtlMs: parseInteger(env.RPC_CACHE_TTL_MS, 5000),
     queryCacheEnabled: parseBoolean(env.QUERY_CACHE_ENABLED, true),
@@ -871,6 +885,34 @@ export function validateConfig(env = process.env) {
     }
     if (!env.EMAIL_FROM) {
       invalid.push("EMAIL_FROM: required when EMAIL_API_URL is set");
+    }
+  }
+
+  if (env.ACCOUNT_LINKS_SESSION_SECRET && Buffer.byteLength(env.ACCOUNT_LINKS_SESSION_SECRET) < 32) {
+    invalid.push("ACCOUNT_LINKS_SESSION_SECRET: must be at least 32 bytes when configured");
+  }
+  const githubSettings = [env.GITHUB_CLIENT_ID, env.GITHUB_CLIENT_SECRET, env.GITHUB_REDIRECT_URI];
+  if (githubSettings.some(Boolean) && githubSettings.some((value) => !value)) {
+    invalid.push("GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, and GITHUB_REDIRECT_URI: configure all three or none");
+  }
+  if ((githubSettings.some(Boolean) || env.ACCOUNT_LINKS_APP_URL) && !env.ACCOUNT_LINKS_SESSION_SECRET) {
+    invalid.push("ACCOUNT_LINKS_SESSION_SECRET: required when GitHub or email account linking is configured");
+  }
+  for (const [name, value] of [
+    ["ACCOUNT_LINKS_APP_URL", env.ACCOUNT_LINKS_APP_URL],
+    ["GITHUB_REDIRECT_URI", env.GITHUB_REDIRECT_URI],
+  ]) {
+    if (!value) continue;
+    try {
+      const parsed = new URL(value);
+      const localHttp = parsed.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname);
+      if (parsed.protocol !== "https:" && !localHttp) {
+        invalid.push(`${name}: must use HTTPS (HTTP is allowed only for localhost development)`);
+      }
+      if (parsed.username || parsed.password) invalid.push(`${name}: must not contain URL credentials`);
+      if (parsed.hash) invalid.push(`${name}: must not contain a URL fragment`);
+    } catch {
+      invalid.push(`${name}: must be a valid URL`);
     }
   }
 

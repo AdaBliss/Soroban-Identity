@@ -51,6 +51,10 @@ empty list returns `503` and disables admin access until a range is configured.
 When `TRUST_PROXY=true`, the first `X-Forwarded-For` address is used; only enable
 this when direct access to the server is restricted to the trusted proxy.
 
+## Connected Accounts
+
+GitHub and verified-email linking are optional and require wallet-bound account sessions. See [CONNECTED_ACCOUNTS.md](CONNECTED_ACCOUNTS.md) for provider setup, required environment variables, API routes, and storage/security constraints.
+
 ## Credential payload encryption
 
 Set `PAYLOAD_ENCRYPTION_ENABLED=true` to require application-layer encryption
