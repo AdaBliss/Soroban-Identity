@@ -53,6 +53,18 @@ describe("ErrorBoundary (#331)", () => {
     expect(screen.getByText(/Something went wrong/i)).toBeTruthy();
   });
 
+  it("shows a friendly message and expandable error details", () => {
+    render(
+      <ErrorBoundary>
+        <BrokenComponent shouldThrow={true} />
+      </ErrorBoundary>,
+    );
+
+    expect(screen.getByText(/could not render this part/i)).toBeTruthy();
+    expect(screen.getByText(/Error details/i)).toBeTruthy();
+    expect(screen.getByText(/test render error/)).toBeTruthy();
+  });
+
   it("does not show fallback when child does not throw", () => {
     render(
       <ErrorBoundary>
