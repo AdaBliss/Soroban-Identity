@@ -11,7 +11,8 @@
     "identity": "Identité (DID)",
     "credentials": "Justificatifs",
     "issuerAnalytics": "Analytique de l'émetteur",
-    "label": "Sections"
+    "label": "Sections",
+    "connectedAccounts": "Comptes associés"
   },
   "wallet": {
     "connect": "Connecter le Portefeuille",
@@ -179,5 +180,39 @@
     "toggleTheme": "Basculer le thème",
     "showHelp": "Afficher les raccourcis clavier",
     "closeDialog": "Fermer la boîte de dialogue ou le modal"
+  },
+  "accounts": {
+    "title": "Comptes associés",
+    "description": "Associez et gérez vos identités GitHub et votre adresse e-mail vérifiée.",
+    "connectWallet": "Connectez un portefeuille pour gérer les comptes associés.",
+    "authenticateDescription": "Vérifiez la propriété du portefeuille pour gérer les comptes. Le portefeuille vous demandera de signer un défi à usage unique.",
+    "authenticate": "Vérifier le portefeuille",
+    "authenticating": "Vérification du portefeuille…",
+    "loading": "Chargement des comptes associés…",
+    "error": "Une erreur est survenue. Réessayez.",
+    "github": "GitHub",
+    "email": "E-mail",
+    "notLinked": "Non associé",
+    "linkedAs": "Connecté en tant que {{account}}",
+    "verified": "Vérifié",
+    "unlink": "Dissocier",
+    "unlinkConfirm": "Dissocier votre compte {{provider}} ? Cette action est irréversible.",
+    "unlinked": "Compte dissocié.",
+    "linkGithub": "Associer GitHub",
+    "openingGithub": "Ouverture de GitHub…",
+    "githubLinked": "Compte GitHub associé.",
+    "popupBlocked": "Le navigateur a bloqué la fenêtre d’autorisation. Autorisez les fenêtres contextuelles et réessayez.",
+    "emailLabel": "Adresse e-mail",
+    "sendVerification": "Envoyer un e-mail de vérification",
+    "sending": "Envoi…",
+    "emailSent": "Si cette adresse peut être associée, un e-mail de vérification a été envoyé.",
+    "emailConfirmed": "Adresse e-mail vérifiée et associée.",
+    "confirmEmail": "Confirmer l’association de l’e-mail",
+    "confirmDescription": "Un jeton de vérification figure dans ce lien. Confirmez avant de l’envoyer pour associer votre adresse e-mail.",
+    "confirming": "Confirmation…",
+    "dismiss": "Plus tard",
+    "sessionExpiry": "La session du portefeuille expire le {{expiry}}.",
+    "walletChanged": "Le portefeuille connecté a changé pendant la vérification. Recommencez.",
+    "networkMismatch": "Le défi concerne un autre réseau Stellar. Changez de réseau et réessayez."
   }
 }

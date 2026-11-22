@@ -188,7 +188,7 @@ test('buildAccessRecord captures method, path, status, duration, IP, and agent',
   assert.equal(record.method, 'POST');
   assert.equal(record.path, '/credentials');
   assert.equal(record.status, 201);
-  assert.ok(record.durationMs >= 20);
+  assert.ok(record.latencyMs >= 20);
   assert.equal(record.ip, '10.0.0.5');
   assert.equal(record.userAgent, 'test-agent/1.0');
   assert.equal(record.contentLength, '42');
@@ -221,6 +221,23 @@ test('buildAccessRecord includes redacted headers and payloads when enabled', ()
   assert.equal(record.requestBody.subject, 'GABC');
   assert.equal(record.requestBody.password, REDACTED);
   assert.equal(record.responseBody.token, REDACTED);
+});
+
+test('buildAccessRecord strips account-link query strings and payloads even when verbose logging is enabled', () => {
+  const req = makeReq({ url: '/account-links/github/callback?code=oauth-code&state=oauth-state' });
+  const record = buildAccessRecord(req, makeRes(200), {
+    requestId: 'req-account-links',
+    startedAt: Date.now(),
+    config: makeConfig({ logHeaders: true, logPayloads: true }),
+    requestBody: { email: 'private@example.com', token: 'verification-token' },
+    responseBody: { token: 'session-token' },
+  });
+
+  assert.equal(record.path, '/account-links/github/callback');
+  assert.equal(record.requestBody, undefined);
+  assert.equal(record.responseBody, undefined);
+  assert.equal(JSON.stringify(record).includes('oauth-code'), false);
+  assert.equal(JSON.stringify(record).includes('private@example.com'), false);
 });
 
 test('buildAccessRecord carries the API key id and tier when present', () => {

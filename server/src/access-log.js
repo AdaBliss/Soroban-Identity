@@ -235,6 +235,9 @@ export class RotatingFileSink {
 export function buildAccessRecord(req, res, { requestId, startedAt, config, requestBody, responseBody }) {
   const latencyMs = Number((Date.now() - startedAt).toFixed(3));
   const status = res.statusCode;
+  const requestPath = String(req.url ?? "");
+  const pathOnly = requestPath.split("?", 1)[0];
+  const sensitiveAccountLinkRoute = /^\/(?:v1\/)?account-links(?:\/|$)/.test(pathOnly);
 
   const did = req.params?.did ?? req.did ?? req.context?.did ?? null;
 
@@ -243,7 +246,9 @@ export function buildAccessRecord(req, res, { requestId, startedAt, config, requ
     requestId,
     did,
     method: req.method,
-    path: req.url,
+    // Account-link URLs can carry OAuth codes/state, wallet addresses, or
+    // email verification data. Keep only the bounded path for these routes.
+    path: sensitiveAccountLinkRoute ? pathOnly : requestPath,
     status,
     latencyMs,
     ip: resolveClientIp(req, { trustProxy: config.trustProxy }),
@@ -257,7 +262,7 @@ export function buildAccessRecord(req, res, { requestId, startedAt, config, requ
     record.headers = redactHeaders(req.headers);
   }
 
-  if (config.logPayloads) {
+  if (config.logPayloads && !sensitiveAccountLinkRoute) {
     const requestPayload = preparePayload(requestBody, config.logPayloadMaxBytes);
     if (requestPayload !== undefined) record.requestBody = requestPayload;
 
