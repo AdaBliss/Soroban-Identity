@@ -22,6 +22,8 @@ const NetworkStatistics = lazy(() => import("./components/NetworkStatistics"));
 const ActivityFeed = lazy(() => import("./components/ActivityFeed"));
 const CustomizableDashboard = lazy(() => import("./components/CustomizableDashboard"));
 const PrivacySettings = lazy(() => import("./components/privacy/PrivacySettings"));
+const BiometricDeviceManager = lazy(() => import("./components/BiometricDeviceManager"));
+const NotificationPreferences = lazy(() => import("./components/NotificationPreferences"));
 const { isShareLinkExpired } = await import("./components/privacy/shareLinks");
 
 const preloadCredentialsPanel = () => {
@@ -41,6 +43,9 @@ const preloadCustomizableDashboard = () => {
 };
 const preloadPrivacySettings = () => {
   void import("./components/privacy/PrivacySettings");
+};
+const preloadBiometricDeviceManager = () => {
+  void import("./components/BiometricDeviceManager");
 };
 import WalletButton from "./components/WalletButton";
 import QRScanner from "./components/QRScanner";
@@ -631,6 +636,7 @@ function AppContent() {
         >
           <Suspense fallback={<LoadingFallback />}>
             <BiometricDeviceManager />
+            <NotificationPreferences />
           </Suspense>
         </section>
       )}
