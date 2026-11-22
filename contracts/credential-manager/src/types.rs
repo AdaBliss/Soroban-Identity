@@ -422,3 +422,63 @@ pub struct DidDocument {
     pub updated_at: u64,
     pub deactivated: bool,
 }
+
+/// Role-based access control roles for the credential-manager contract.
+///
+/// - `Owner`: full administrative control (role management, config, upgrades).
+/// - `Issuer`: may issue, renew, and revoke credentials.
+/// - `User`: may hold credentials and perform subject-side operations.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum Role {
+    Owner = 0,
+    Issuer = 1,
+    User = 2,
+}
+
+impl Role {
+    pub const ALL: [Role; 3] = [Role::Owner, Role::Issuer, Role::User];
+
+    /// Returns true if `self` is allowed to perform an action requiring `required`.
+    /// `Owner` is a superset of every other role.
+    pub fn satisfies(&self, required: Role) -> bool {
+        match self {
+            Role::Owner => true,
+            Role::Issuer => matches!(required, Role::Issuer | Role::User),
+            Role::User => matches!(required, Role::User),
+        }
+    }
+}
+
+/// A role granted to an address, optionally scoped and time-bounded.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RoleAssignment {
+    pub account: Address,
+    pub role: Role,
+    pub granted_by: Address,
+    pub granted_at: u64,
+    /// Optional expiry (0 means no expiry).
+    pub expires_at: u64,
+    pub active: bool,
+}
+
+impl RoleAssignment {
+    pub fn is_active_at(&self, now: u64) -> bool {
+        self.active && (self.expires_at == 0 || now < self.expires_at)
+    }
+}
+
+/// Error codes related to role-based access control.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum RoleError {
+    RoleNotFound = 0,
+    InsufficientRole = 1,
+    RoleAlreadyGranted = 2,
+    CannotRevokeOwner = 3,
+    InvalidRole = 4,
+    RoleExpired = 5,
+}

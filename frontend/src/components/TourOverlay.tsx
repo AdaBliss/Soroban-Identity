@@ -7,8 +7,7 @@ import React, {
 } from 'react';
 
 import {
-  DEFAULT_TOUR_STEPS,
-  TOUR_STORAGE_PREFIX,
+  TOUR_PATHS,
   type TourPath,
   type TourStep,
 } from '../tour/steps';
@@ -24,11 +23,12 @@ export interface TourOverlayProps {
   onClose?: (reason: 'completed' | 'skipped') => void;
   /** Optional custom step configs; defaults to shared issuer/holder paths. */
   steps?: Record<TourPath, TourStep[]>;
-  /** localStorage key prefix for progress persistence. */
-  storageKeyPrefix?: string;
 }
 
-const DEFAULT_STORAGE_PREFIX = TOUR_STORAGE_PREFIX;
+const DEFAULT_TOUR_STEPS: Record<TourPath, TourStep[]> = {
+  issuer: TOUR_PATHS.issuer.steps,
+  holder: TOUR_PATHS.holder.steps,
+};
 
 interface Rect {
   top: number;
@@ -101,7 +101,6 @@ export const TourOverlay: React.FC<TourOverlayProps> = ({
   open,
   onClose,
   steps,
-  storageKeyPrefix = DEFAULT_STORAGE_PREFIX,
 }) => {
   const stepConfig = useMemo(
     () => (steps ?? DEFAULT_TOUR_STEPS)[path] ?? [],
@@ -112,41 +111,6 @@ export const TourOverlay: React.FC<TourOverlayProps> = ({
   const [rect, setRect] = useState<Rect | null>(null);
   const tooltipRef = useRef<HTMLDivElement | null>(null);
   const previouslyFocused = useRef<HTMLElement | null>(null);
-
-  const storageKey = `${storageKeyPrefix}:${path}`;
-
-  const persistProgress = useCallback(
-    (completed: boolean, stepIndex: number) => {
-      try {
-        const payload = {
-          completed,
-          stepIndex,
-          updatedAt: new Date().toISOString(),
-        };
-        window.localStorage.setItem(storageKey, JSON.stringify(payload));
-      } catch {
-        // Ignore storage failures (private mode, quota, etc.)
-      }
-    },
-    [storageKey],
-  );
-
-  const readProgress = useCallback((): { completed: boolean; stepIndex: number } | null => {
-    try {
-      const raw = window.localStorage.getItem(storageKey);
-      if (!raw) return null;
-      const parsed = JSON.parse(raw);
-      if (typeof parsed?.completed === 'boolean') {
-        return {
-          completed: parsed.completed,
-          stepIndex: typeof parsed.stepIndex === 'number' ? parsed.stepIndex : 0,
-        };
-      }
-      return null;
-    } catch {
-      return null;
-    }
-  }, [storageKey]);
 
   // Reset to first step whenever the tour is (re)opened.
   useEffect(() => {
@@ -202,11 +166,9 @@ export const TourOverlay: React.FC<TourOverlayProps> = ({
 
   const finish = useCallback(
     (reason: 'completed' | 'skipped') => {
-      const finalIndex = reason === 'completed' ? stepConfig.length : index;
-      persistProgress(reason === 'completed', finalIndex);
       onClose?.(reason);
     },
-    [index, onClose, persistProgress, stepConfig.length],
+    [onClose],
   );
 
   const handleNext = useCallback(() => {
@@ -216,20 +178,17 @@ export const TourOverlay: React.FC<TourOverlayProps> = ({
     }
     const next = index + 1;
     setIndex(next);
-    persistProgress(false, next);
-  }, [index, stepConfig.length, finish, persistProgress]);
+  }, [index, stepConfig.length, finish]);
 
   const handleRestart = useCallback(() => {
     setIndex(0);
-    persistProgress(false, 0);
-  }, [persistProgress]);
+  }, []);
 
   const handleBack = useCallback(() => {
     if (index <= 0) return;
     const prev = index - 1;
     setIndex(prev);
-    persistProgress(false, prev);
-  }, [index, persistProgress]);
+  }, [index]);
 
   const handleSkip = useCallback(() => {
     finish('skipped');
@@ -253,14 +212,6 @@ export const TourOverlay: React.FC<TourOverlayProps> = ({
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [open, handleSkip, handleNext, handleBack]);
-
-  // Persist the starting step when the tour opens.
-  useEffect(() => {
-    if (open) {
-      persistProgress(false, 0);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, path]);
 
   if (!open || stepConfig.length === 0) {
     return null;
@@ -493,29 +444,5 @@ export const TourOverlay: React.FC<TourOverlayProps> = ({
     </div>
   );
 };
-
-/**
- * Restart entry point. Clears stored progress for the given path and
- * returns a handler that reopens the tour.
- */
-export function useTourRestart(
-  path: TourPath,
-  storageKeyPrefix: string = DEFAULT_STORAGE_PREFIX,
-) {
-  const [open, setOpen] = useState(false);
-
-  const restart = useCallback(() => {
-    try {
-      window.localStorage.removeItem(`${storageKeyPrefix}:${path}`);
-    } catch {
-      // Ignore storage failures.
-    }
-    setOpen(true);
-  }, [path, storageKeyPrefix]);
-
-  const close = useCallback(() => setOpen(false), []);
-
-  return { open, restart, close };
-}
 
 export default TourOverlay;

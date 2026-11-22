@@ -154,6 +154,7 @@ export default function DidQrCode({ address, did, asModal = false, onClose }: Di
           size={QR_SIZE}
           level="M"
           marginSize={2}
+          aria-label={`QR code for ${value}`}
           style={{ width: '100%', height: 'auto', maxWidth: QR_SIZE, display: 'block' }}
         />
       </div>

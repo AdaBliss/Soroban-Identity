@@ -566,6 +566,16 @@ export function loadConfig(env = process.env) {
     emailApiUrl: env.EMAIL_API_URL ?? "",
     emailApiKey: env.EMAIL_API_KEY ?? "",
     emailFrom: env.EMAIL_FROM ?? "",
+    // Wallet-bound connected accounts (#1249). The independent secret is
+    // required before the challenge/session endpoints become available.
+    accountLinksSessionSecret: env.ACCOUNT_LINKS_SESSION_SECRET ?? "",
+    accountLinksStorePath: env.ACCOUNT_LINKS_STORE_PATH
+      ? path.resolve(env.ACCOUNT_LINKS_STORE_PATH)
+      : path.join(DEFAULT_DATA_DIR, "account-links.json"),
+    accountLinksAppUrl: env.ACCOUNT_LINKS_APP_URL ?? "",
+    githubClientId: env.GITHUB_CLIENT_ID ?? "",
+    githubClientSecret: env.GITHUB_CLIENT_SECRET ?? "",
+    githubRedirectUri: env.GITHUB_REDIRECT_URI ?? "",
     notificationEmail: env.NOTIFICATION_EMAIL ?? "",
     subjectNotificationEmails: parseJson(env.SUBJECT_NOTIFICATION_EMAILS, {}),
     notificationMaxRetries: parseInteger(env.NOTIFICATION_MAX_RETRIES, 3),
@@ -576,6 +586,10 @@ export function loadConfig(env = process.env) {
     stellarCli: env.STELLAR_CLI ?? "stellar",
     sourceAccount: resolveSourceAccount(env),
     network: env.STELLAR_NETWORK ?? "testnet",
+    sorobanNetworkPassphrase: env.SOROBAN_NETWORK_PASSPHRASE ??
+      ((env.STELLAR_NETWORK ?? "testnet") === "mainnet"
+        ? "Public Global Stellar Network ; September 2015"
+        : "Test SDF Network ; September 2015"),
     rpcUrl: env.STELLAR_RPC_URL ?? env.RPC_URL ?? "https://soroban-testnet.stellar.org",
     rpcCacheTtlMs: parseInteger(env.RPC_CACHE_TTL_MS, 5000),
     queryCacheEnabled: parseBoolean(env.QUERY_CACHE_ENABLED, true),
@@ -595,6 +609,36 @@ export function loadConfig(env = process.env) {
     circuitBreakerEnabled: parseBoolean(env.CIRCUIT_BREAKER_ENABLED, true),
     // EVENT_POLL_INTERVAL_MS=0 disables the event poller (allowZero: true)
     eventPollIntervalMs: parseInteger(env.EVENT_POLL_INTERVAL_MS, 5000, true),
+    // #1272 BE-08: Horizon event indexer service. Polls Horizon for contract
+    // events and persists them to PostgreSQL. Disabled by default so an
+    // existing deployment is unaffected until it is explicitly turned on.
+    indexerEnabled: parseBoolean(env.INDEXER_ENABLED, false),
+    indexerHorizonUrl:
+      env.HORIZON_URL ?? "https://horizon-testnet.stellar.org",
+    // Comma-separated list of contract ids to index. Empty means every
+    // contract event Horizon returns is stored.
+    indexerContractIds: parseList(env.INDEXER_CONTRACT_IDS, []),
+    // INDEXER_POLL_INTERVAL_MS=0 disables polling (allowZero: true)
+    indexerPollIntervalMs: parseInteger(
+      env.INDEXER_POLL_INTERVAL_MS,
+      5000,
+      true,
+    ),
+    // PostgreSQL connection used by the indexer. DATABASE_URL takes
+    // precedence; the discrete settings are the fallback.
+    indexerDatabaseUrl: env.DATABASE_URL ?? "",
+    indexerDbHost: env.DB_HOST ?? "localhost",
+    indexerDbPort: parseInteger(env.DB_PORT, 5432),
+    indexerDbName: env.DB_NAME ?? "soroban_indexer",
+    indexerDbUser: env.DB_USER ?? "postgres",
+    indexerDbPassword: env.DB_PASSWORD ?? "",
+    indexerDbPoolMax: parseInteger(env.DB_POOL_MAX, 10),
+    indexerDbConnectionTimeoutMs: parseInteger(
+      env.DB_CONNECTION_TIMEOUT_MS,
+      5000,
+    ),
+    // #1325 BUG-28: indexer timestamps are stored in UTC as well.
+    indexerDbTimezone: resolveDbTimezone(env),
     // #750: GET /events/poll long-polling. Timeout is clamped to
     // [1s, longPollMaxTimeoutMs] regardless of what a caller requests.
     longPollDefaultTimeoutMs: parseInteger(env.LONG_POLL_DEFAULT_TIMEOUT_MS, 30_000),
@@ -730,6 +774,10 @@ export function validateConfig(env = process.env) {
     { key: "RPC_RETRY_BASE_MS", desc: "must be a valid integer" },
     { key: "RPC_RETRY_BACKOFF", desc: "must be a valid integer" },
     { key: "EVENT_POLL_INTERVAL_MS", desc: "must be a valid integer" },
+    { key: "INDEXER_POLL_INTERVAL_MS", desc: "must be a valid integer" },
+    { key: "DB_PORT", desc: "must be a valid integer" },
+    { key: "DB_POOL_MAX", desc: "must be a valid integer" },
+    { key: "DB_CONNECTION_TIMEOUT_MS", desc: "must be a valid integer" },
     { key: "LONG_POLL_DEFAULT_TIMEOUT_MS", desc: "must be a valid integer" },
     { key: "LONG_POLL_MAX_TIMEOUT_MS", desc: "must be a valid integer" },
     { key: "RATE_LIMIT_MAX_BUCKETS", desc: "must be a valid integer" },
@@ -840,6 +888,34 @@ export function validateConfig(env = process.env) {
     }
   }
 
+  if (env.ACCOUNT_LINKS_SESSION_SECRET && Buffer.byteLength(env.ACCOUNT_LINKS_SESSION_SECRET) < 32) {
+    invalid.push("ACCOUNT_LINKS_SESSION_SECRET: must be at least 32 bytes when configured");
+  }
+  const githubSettings = [env.GITHUB_CLIENT_ID, env.GITHUB_CLIENT_SECRET, env.GITHUB_REDIRECT_URI];
+  if (githubSettings.some(Boolean) && githubSettings.some((value) => !value)) {
+    invalid.push("GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, and GITHUB_REDIRECT_URI: configure all three or none");
+  }
+  if ((githubSettings.some(Boolean) || env.ACCOUNT_LINKS_APP_URL) && !env.ACCOUNT_LINKS_SESSION_SECRET) {
+    invalid.push("ACCOUNT_LINKS_SESSION_SECRET: required when GitHub or email account linking is configured");
+  }
+  for (const [name, value] of [
+    ["ACCOUNT_LINKS_APP_URL", env.ACCOUNT_LINKS_APP_URL],
+    ["GITHUB_REDIRECT_URI", env.GITHUB_REDIRECT_URI],
+  ]) {
+    if (!value) continue;
+    try {
+      const parsed = new URL(value);
+      const localHttp = parsed.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname);
+      if (parsed.protocol !== "https:" && !localHttp) {
+        invalid.push(`${name}: must use HTTPS (HTTP is allowed only for localhost development)`);
+      }
+      if (parsed.username || parsed.password) invalid.push(`${name}: must not contain URL credentials`);
+      if (parsed.hash) invalid.push(`${name}: must not contain a URL fragment`);
+    } catch {
+      invalid.push(`${name}: must be a valid URL`);
+    }
+  }
+
   // Geo-distributed read replicas (#1051): every configured endpoint must be a
   // usable URL, and routing must only point at regions that exist.
   const replicaEndpoints = parseReplicaEndpoints(env.REPLICA_ENDPOINTS);
@@ -881,6 +957,37 @@ export function validateConfig(env = process.env) {
     invalid.push(
       `REPLICA_LOCAL_REGION: '${replicaLocalRegion}' is neither a replica endpoint nor a routing key`,
     );
+  }
+
+  // #1272 BE-08: Horizon event indexer. When enabled it needs a usable
+  // Horizon URL and a database to write to.
+  const indexerEnabled = parseBoolean(env.INDEXER_ENABLED, false);
+  const horizonUrl = env.HORIZON_URL;
+  if (horizonUrl !== undefined && horizonUrl !== "") {
+    try {
+      new URL(horizonUrl);
+    } catch {
+      invalid.push("HORIZON_URL: must be a valid URL");
+    }
+  }
+  if (indexerEnabled) {
+    const databaseUrl = env.DATABASE_URL;
+    if (databaseUrl !== undefined && databaseUrl !== "") {
+      try {
+        const parsed = new URL(databaseUrl);
+        if (parsed.protocol !== "postgres:" && parsed.protocol !== "postgresql:") {
+          invalid.push(
+            "DATABASE_URL: must use the postgres:// or postgresql:// scheme",
+          );
+        }
+      } catch {
+        invalid.push("DATABASE_URL: must be a valid URL");
+      }
+    } else if (!env.DB_NAME) {
+      invalid.push(
+        "DATABASE_URL or DB_NAME: required when INDEXER_ENABLED is true",
+      );
+    }
   }
 
   const cronSchedule = env.EXPIRY_CRON_SCHEDULE;
@@ -988,6 +1095,21 @@ export function logDefaultValues(env = process.env) {
     { key: "RPC_RETRY_BASE_MS", defaultVal: "500" },
     { key: "RPC_RETRY_BACKOFF", defaultVal: "2" },
     { key: "EVENT_POLL_INTERVAL_MS", defaultVal: "5000" },
+    { key: "INDEXER_ENABLED", defaultVal: "false" },
+    {
+      key: "HORIZON_URL",
+      defaultVal: "'https://horizon-testnet.stellar.org'",
+    },
+    { key: "INDEXER_CONTRACT_IDS", defaultVal: "'' (all contracts)" },
+    { key: "INDEXER_POLL_INTERVAL_MS", defaultVal: "5000" },
+    { key: "DATABASE_URL", defaultVal: "'' (discrete DB_* settings)" },
+    { key: "DB_HOST", defaultVal: "'localhost'" },
+    { key: "DB_PORT", defaultVal: "5432" },
+    { key: "DB_NAME", defaultVal: "'soroban_indexer'" },
+    { key: "DB_USER", defaultVal: "'postgres'" },
+    { key: "DB_PASSWORD", defaultVal: "''" },
+    { key: "DB_POOL_MAX", defaultVal: "10" },
+    { key: "DB_CONNECTION_TIMEOUT_MS", defaultVal: "5000" },
     { key: "LONG_POLL_DEFAULT_TIMEOUT_MS", defaultVal: "30000" },
     { key: "LONG_POLL_MAX_TIMEOUT_MS", defaultVal: "60000" },
     { key: "QUOTA_OVERAGE_MODE", defaultVal: "'block'" },

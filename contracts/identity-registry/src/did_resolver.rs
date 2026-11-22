@@ -61,6 +61,8 @@ pub enum DidResolverError {
     MalformedDid,
     DidMethodAlreadyRegistered,
     NotFound,
+    /// The DID has been deactivated and can no longer be resolved.
+    DidDeactivated,
 }
 
 /// Storage keys for the DID resolver.
@@ -70,6 +72,8 @@ pub enum DidResolverKey {
     MethodRegistry(Symbol),
     /// Cached resolved documents keyed by DID string.
     ResolutionCache(String),
+    /// Deactivation flag keyed by DID string.
+    Deactivated(String),
     /// Latest recorded version metadata keyed by DID string.
     LatestVersion(String),
     /// Historical versions keyed by (DID string, version number).
@@ -190,8 +194,41 @@ impl DidResolver {
         Ok((method_sym, id_str))
     }
 
+    /// Check whether a DID has been deactivated.
+    pub fn is_deactivated(env: &Env, did: String) -> bool {
+        env.storage()
+            .persistent()
+            .has(&DidResolverKey::Deactivated(did))
+    }
+
+    /// Deactivate a DID. Admin-gated. Invalidates any cached resolution so
+    /// subsequent lookups observe the deactivated state.
+    pub fn deactivate_did(
+        env: &Env,
+        caller: Address,
+        did: String,
+    ) -> Result<(), DidResolverError> {
+        caller.require_auth();
+        let admin = Self::admin(env)?;
+        if caller != admin {
+            return Err(DidResolverError::NotFound);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DidResolverKey::Deactivated(did.clone()), &true);
+        // Invalidate the cache so the deactivated state is respected.
+        Self::clear_cache(env, did);
+        Ok(())
+    }
+
     /// Resolve a DID string into a DID document.
     pub fn resolve_did(env: &Env, did: String) -> Result<DidDocument, DidResolverError> {
+        // Deactivated DIDs can no longer be resolved.
+        if Self::is_deactivated(env, did.clone()) {
+            return Err(DidResolverError::DidDeactivated);
+        }
+
         // Check cache first.
         let cache_key = DidResolverKey::ResolutionCache(did.clone());
         if let Some(cached) = env
@@ -682,6 +719,194 @@ mod tests {
         assert_eq!(doc2.id, did);
     }
 
+    // --- Additional negative / edge cases for resolve_did ---
+
+    #[test]
+    fn test_malformed_empty_did() {
+        let (env, _admin) = setup();
+        let did = String::from_slice(&env, "");
+        let res = DidResolver::resolve_did(&env, did);
+        assert_eq!(res, Err(DidResolverError::MalformedDid));
+    }
+
+    #[test]
+    fn test_malformed_too_short() {
+        let (env, _admin) = setup();
+        let did = String::from_slice(&env, "did:");
+        let res = DidResolver::resolve_did(&env, did);
+        assert_eq!(res, Err(DidResolverError::MalformedDid));
+    }
+
+    #[test]
+    fn test_malformed_wrong_prefix() {
+        let (env, _admin) = setup();
+        let did = String::from_slice(&env, "dix:web:example.com");
+        let res = DidResolver::resolve_did(&env, did);
+        assert_eq!(res, Err(DidResolverError::MalformedDid));
+    }
+
+    #[test]
+    fn test_malformed_no_second_colon() {
+        let (env, _admin) = setup();
+        let did = String::from_slice(&env, "did:web");
+        let res = DidResolver::resolve_did(&env, did);
+        assert_eq!(res, Err(DidResolverError::MalformedDid));
+    }
+
+    #[test]
+    fn test_malformed_empty_method_and_id() {
+        let (env, _admin) = setup();
+        let did = String::from_slice(&env, "did::");
+        let res = DidResolver::resolve_did(&env, did);
+        assert_eq!(res, Err(DidResolverError::MalformedDid));
+    }
+
+    #[test]
+    fn test_unsupported_custom_method_not_registered() {
+        let (env, _admin) = setup();
+        let did = String::from_slice(&env, "did:custom:abc");
+        let res = DidResolver::resolve_did(&env, did);
+        assert_eq!(res, Err(DidResolverError::UnsupportedDidMethod));
+    }
+
+    #[test]
+    fn test_unsupported_method_does_not_cache() {
+        let (env, _admin) = setup();
+        let did = String::from_slice(&env, "did:unknown:12345");
+        let _ = DidResolver::resolve_did(&env, did.clone());
+        // A failed resolution must not populate the cache.
+        let cache_key = DidResolverKey::ResolutionCache(did.clone());
+        assert!(!env.storage().persistent().has(&cache_key));
+    }
+
+    #[test]
+    fn test_malformed_does_not_cache() {
+        let (env, _admin) = setup();
+        let did = String::from_slice(&env, "notadid");
+        let _ = DidResolver::resolve_did(&env, did.clone());
+        let cache_key = DidResolverKey::ResolutionCache(did.clone());
+        assert!(!env.storage().persistent().has(&cache_key));
+    }
+
+    #[test]
+    fn test_cache_populated_after_resolve() {
+        let (env, _admin) = setup();
+        let did = String::from_slice(&env, "did:web:example.com");
+        let cache_key = DidResolverKey::ResolutionCache(did.clone());
+        assert!(!env.storage().persistent().has(&cache_key));
+        let _ = DidResolver::resolve_did(&env, did.clone()).unwrap();
+        assert!(env.storage().persistent().has(&cache_key));
+    }
+
+    #[test]
+    fn test_cache_returns_same_document() {
+        let (env, _admin) = setup();
+        let did = String::from_slice(&env, "did:web:example.com");
+        let first = DidResolver::resolve_did(&env, did.clone()).unwrap();
+        let second = DidResolver::resolve_did(&env, did.clone()).unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn test_clear_cache_removes_entry() {
+        let (env, _admin) = setup();
+        let did = String::from_slice(&env, "did:web:example.com");
+        let _ = DidResolver::resolve_did(&env, did.clone()).unwrap();
+        let cache_key = DidResolverKey::ResolutionCache(did.clone());
+        assert!(env.storage().persistent().has(&cache_key));
+        DidResolver::clear_cache(&env, did.clone());
+        assert!(!env.storage().persistent().has(&cache_key));
+    }
+
+    #[test]
+    fn test_clear_cache_unknown_did_is_noop() {
+        let (env, _admin) = setup();
+        let did = String::from_slice(&env, "did:web:never-resolved.com");
+        // Clearing a non-existent cache entry must not panic.
+        DidResolver::clear_cache(&env, did.clone());
+        let cache_key = DidResolverKey::ResolutionCache(did.clone());
+        assert!(!env.storage().persistent().has(&cache_key));
+    }
+
+    #[test]
+    fn test_resolve_after_clear_repopulates_cache() {
+        let (env, _admin) = setup();
+        let did = String::from_slice(&env, "did:web:example.com");
+        let _ = DidResolver::resolve_did(&env, did.clone()).unwrap();
+        DidResolver::clear_cache(&env, did.clone());
+        let cache_key = DidResolverKey::ResolutionCache(did.clone());
+        assert!(!env.storage().persistent().has(&cache_key));
+        let doc = DidResolver::resolve_did(&env, did.clone()).unwrap();
+        assert_eq!(doc.id, did);
+        assert!(env.storage().persistent().has(&cache_key));
+    }
+
+    #[test]
+    fn test_resolve_soroban_document_fields() {
+        let (env, _admin) = setup();
+        let addr = Address::generate(&env);
+        let did = String::from_slice(&env, &format!("did:soroban:{}", addr.to_string()));
+        let doc = DidResolver::resolve_did(&env, did.clone()).unwrap();
+        assert_eq!(doc.id, did);
+        assert_eq!(doc.controller, addr.to_string());
+        assert_eq!(doc.services.len(), 0);
+        let vm = doc.verification_methods.get(0).unwrap();
+        assert_eq!(vm.controller, did);
+        assert_eq!(
+            vm.method_type.to_string(),
+            String::from_slice(&env, "Ed25519VerificationKey2020").to_string()
+        );
+    }
+
+    #[test]
+    fn test_resolve_web_document_fields() {
+        let (env, _admin) = setup();
+        let did = String::from_slice(&env, "did:web:example.com");
+        let doc = DidResolver::resolve_did(&env, did.clone()).unwrap();
+        assert_eq!(doc.controller, did);
+        assert_eq!(doc.verification_methods.len(), 0);
+        let service = doc.services.get(0).unwrap();
+        assert_eq!(
+            service.endpoint.to_string(),
+            String::from_slice(&env, "https://example.com/.well-known/did.json").to_string()
+        );
+    }
+
+    #[test]
+    fn test_resolve_key_invalid_base58() {
+        let (env, _admin) = setup();
+        // '0' and 'O' are not in the base58 alphabet.
+        let did = String::from_slice(&env, "did:key:z0OIl");
+        let res = DidResolver::resolve_did(&env, did);
+        assert_eq!(res, Err(DidResolverError::MalformedDid));
+    }
+
+    #[test]
+    fn test_deactivated_did_cannot_resolve() {
+        let (env, admin) = setup();
+        let did = String::from_slice(&env, "did:web:example.com");
+        // Prime the cache.
+        let _ = DidResolver::resolve_did(&env, did.clone()).unwrap();
+        assert!(!DidResolver::is_deactivated(&env, did.clone()));
+
+        DidResolver::deactivate_did(&env, admin, did.clone()).unwrap();
+        assert!(DidResolver::is_deactivated(&env, did.clone()));
+
+        // Cache must be invalidated and resolution must fail.
+        let res = DidResolver::resolve_did(&env, did);
+        assert_eq!(res, Err(DidResolverError::DidDeactivated));
+    }
+
+    #[test]
+    fn test_deactivate_requires_admin() {
+        let (env, _admin) = setup();
+        let caller = Address::generate(&env);
+        let did = String::from_slice(&env, "did:web:example.com");
+        let res = DidResolver::deactivate_did(&env, caller, did.clone());
+        assert!(res.is_err());
+        assert!(!DidResolver::is_deactivated(&env, did));
+    }
+
     #[test]
     fn test_record_and_get_history() {
         let (env, _admin) = setup();
@@ -769,6 +994,81 @@ mod tests {
         let did = String::from_slice(&env, "notadid");
         let res = DidResolver::resolve_identity(&env, did);
         assert_eq!(res, Err(DidResolverError::MalformedDid));
+    }
+
+    #[test]
+    fn test_resolve_key_without_multibase_prefix() {
+        let (env, _admin) = setup();
+        // No 'z' prefix: payload is decoded as-is.
+        let did = String::from_slice(&env, "did:key:6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK");
+        let doc = DidResolver::resolve_did(&env, did.clone()).unwrap();
+        assert_eq!(doc.id, did);
+        assert_eq!(doc.verification_methods.len(), 1);
+    }
+
+    #[test]
+    fn test_resolve_custom_document_fields() {
+        let (env, admin) = setup();
+        let method = Symbol::new(&env, "example");
+        let handler = Symbol::new(&env, "example_handler");
+        DidResolver::register_did_method(&env, admin, method, handler.clone()).unwrap();
+
+        let did = String::from_slice(&env, "did:example:12345");
+        let doc = DidResolver::resolve_did(&env, did.clone()).unwrap();
+        assert_eq!(doc.controller, did);
+        assert_eq!(doc.verification_methods.len(), 0);
+        let service = doc.services.get(0).unwrap();
+        assert_eq!(service.service_type.to_string(), handler.to_string());
+        assert_eq!(
+            service.endpoint.to_string(),
+            String::from_slice(&env, "12345").to_string()
+        );
+    }
+
+    #[test]
+    fn test_register_method_non_admin_rejected() {
+        let (env, _admin) = setup();
+        let non_admin = Address::generate(&env);
+        let method = Symbol::new(&env, "example");
+        let handler = Symbol::new(&env, "example_handler");
+        let res = DidResolver::register_did_method(&env, non_admin, method.clone(), handler);
+        assert_eq!(res, Err(DidResolverError::UnsupportedDidMethod));
+        assert!(!DidResolver::is_method_registered(&env, method));
+    }
+
+    #[test]
+    fn test_is_method_registered_reflects_registration() {
+        let (env, admin) = setup();
+        let method = Symbol::new(&env, "example");
+        let handler = Symbol::new(&env, "example_handler");
+        assert!(!DidResolver::is_method_registered(&env, method.clone()));
+        DidResolver::register_did_method(&env, admin, method.clone(), handler).unwrap();
+        assert!(DidResolver::is_method_registered(&env, method));
+    }
+
+    #[test]
+    fn test_resolve_after_deactivation_returns_err() {
+        // Simulates resolution after a DID has been deactivated: the method
+        // registration backing the DID is removed, so resolution must fail
+        // rather than returning a stale document.
+        let (env, admin) = setup();
+        let method = Symbol::new(&env, "example");
+        let handler = Symbol::new(&env, "example_handler");
+        DidResolver::register_did_method(&env, admin, method.clone(), handler).unwrap();
+
+        let did = String::from_slice(&env, "did:example:12345");
+        let doc = DidResolver::resolve_did(&env, did.clone()).unwrap();
+        assert_eq!(doc.id, did);
+
+        // Deactivate: drop the cached document and the method registration.
+        DidResolver::clear_cache(&env, did.clone());
+        env.storage()
+            .persistent()
+            .remove(&DidResolverKey::MethodRegistry(method.clone()));
+        assert!(!DidResolver::is_method_registered(&env, method));
+
+        let res = DidResolver::resolve_did(&env, did);
+        assert_eq!(res, Err(DidResolverError::UnsupportedDidMethod));
     }
 
     #[test]

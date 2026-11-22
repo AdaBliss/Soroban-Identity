@@ -184,6 +184,7 @@ import { createRequestDeduplication } from "./middleware/dedupe.js";
 import { createIdentityRouter } from "./routes/identity.js";
 import { verifyJwt } from "./jwt-auth.js";
 import { createIpfsStorage } from "./ipfs-storage.js";
+import { AccountLinksError, AccountLinksService } from "./account-links.js";
 const SERVER_VERSION = "0.1.0";
 const MIN_SDK_VERSION = "0.1.0";
 const SERVER_FEATURES = [
@@ -201,6 +202,7 @@ const SERVER_FEATURES = [
   "multi_layer_cache",
   "usage_metering",
   "billing",
+  "connected_accounts",
 ];
 
 /** Top-level fields selectable via `?fields=` on a credential resource. */
@@ -220,6 +222,11 @@ const CREDENTIAL_FIELDS = [
 ];
 
 const usageTracker = new UsageTracker();
+
+function sendAccountLinksError(res, error) {
+  if (!(error instanceof AccountLinksError)) throw error;
+  return sendJson(res, error.status, { error: error.code, message: error.message });
+}
 
 function contractMetadata(metadata) {
   return Object.fromEntries(Object.entries(metadata ?? {}).map(([key, value]) => [
@@ -279,6 +286,7 @@ export function createApp({
   cacheManager = null,
   meteringService = null,
   ipfsStorage = createIpfsStorage(config),
+  accountLinksService = new AccountLinksService(config, { emailTransport }),
 }) {
   // Expose the key service on config so http-utils.requireAuth can validate
   // issued API keys instead of falling back to the single admin key.
@@ -764,7 +772,7 @@ export function createApp({
     // #1052: replay prevention. Only state-changing methods are checked, and
     // operational endpoints (plus the browser-posted CSP report) are exempt
     // because they cannot carry client credentials.
-    const isNonceExempt = isExempt || pathname === "/csp-report";
+    const isNonceExempt = isExempt || pathname === "/csp-report" || pathname === "/account-links" || pathname.startsWith("/account-links/");
     const isStateChanging = !["GET", "HEAD", "OPTIONS"].includes(req.method);
     if (!isNonceExempt && isStateChanging) {
       const nonceResult = await checkNonce(req, res);
@@ -793,7 +801,7 @@ export function createApp({
     // probe has to work without client credentials.
     // A CSP violation report is posted by the browser itself, which has no
     // API key and no signing secret, so it can never carry a signature.
-    const isSigningExempt = isExempt || pathname === "/csp-report";
+    const isSigningExempt = isExempt || pathname === "/csp-report" || pathname === "/account-links" || pathname.startsWith("/account-links/");
 
     if (config.requestSigningEnabled && !isSigningExempt) {
       const mustBeSigned =
@@ -1598,6 +1606,111 @@ export function createApp({
             error: "openapi_spec_unavailable",
             message: "No OpenAPI specification could be loaded.",
           });
+        }
+
+        // ── Wallet-bound connected accounts (#1249) ─────────────────────
+        if (pathname === "/account-links" || pathname.startsWith("/account-links/")) {
+          res.setHeader("Cache-Control", "no-store");
+        }
+        const getLinkedWallet = () => {
+          const authorization = req.headers.authorization;
+          const token = typeof authorization === "string"
+            ? authorization.replace(/^Bearer\s+/i, "").trim()
+            : "";
+          return accountLinksService.authenticate(token);
+        };
+
+        if (req.method === "GET" && pathname === "/account-links/challenge") {
+          try {
+            return sendJson(res, 200, await accountLinksService.issueChallenge(url.searchParams.get("address")));
+          } catch (error) {
+            return sendAccountLinksError(res, error);
+          }
+        }
+
+        if (req.method === "POST" && pathname === "/account-links/session") {
+          if (validateContentType(req, res)) return;
+          const body = await readJson(req, config);
+          if (body.__payloadTooLarge) {
+            return sendJson(res, 413, { code: "PAYLOAD_TOO_LARGE", message: "Request body exceeds the size limit." });
+          }
+          try {
+            return sendJson(res, 200, await accountLinksService.createSession(body));
+          } catch (error) {
+            return sendAccountLinksError(res, error);
+          }
+        }
+
+        if (req.method === "GET" && pathname === "/account-links") {
+          try {
+            return sendJson(res, 200, await accountLinksService.getLinks(getLinkedWallet()));
+          } catch (error) {
+            return sendAccountLinksError(res, error);
+          }
+        }
+
+        if (req.method === "POST" && pathname === "/account-links/github/start") {
+          if (validateContentType(req, res)) return;
+          const body = await readJson(req, config);
+          if (body.__payloadTooLarge) {
+            return sendJson(res, 413, { code: "PAYLOAD_TOO_LARGE", message: "Request body exceeds the size limit." });
+          }
+          try {
+            return sendJson(res, 200, await accountLinksService.beginGithubLink(getLinkedWallet()));
+          } catch (error) {
+            return sendAccountLinksError(res, error);
+          }
+        }
+
+        if (req.method === "GET" && pathname === "/account-links/github/callback") {
+          try {
+            if (url.searchParams.has("error")) {
+              return sendText(res, 400, "GitHub linking was cancelled. Return to Soroban Identity and try again.");
+            }
+            const result = await accountLinksService.completeGithubCallback({
+              code: url.searchParams.get("code"),
+              state: url.searchParams.get("state"),
+            });
+            return sendText(res, 200, `GitHub account @${result.login} is linked. Return to Soroban Identity; this panel will refresh automatically.`);
+          } catch (error) {
+            return sendAccountLinksError(res, error);
+          }
+        }
+
+        if (req.method === "POST" && pathname === "/account-links/email") {
+          if (validateContentType(req, res)) return;
+          const body = await readJson(req, config);
+          if (body.__payloadTooLarge) {
+            return sendJson(res, 413, { code: "PAYLOAD_TOO_LARGE", message: "Request body exceeds the size limit." });
+          }
+          try {
+            return sendJson(res, 202, await accountLinksService.sendEmailVerification(getLinkedWallet(), body.email));
+          } catch (error) {
+            return sendAccountLinksError(res, error);
+          }
+        }
+
+        if (req.method === "POST" && pathname === "/account-links/email/confirm") {
+          if (validateContentType(req, res)) return;
+          const body = await readJson(req, config);
+          if (body.__payloadTooLarge) {
+            return sendJson(res, 413, { code: "PAYLOAD_TOO_LARGE", message: "Request body exceeds the size limit." });
+          }
+          try {
+            const result = await accountLinksService.confirmEmail(body.token);
+            return sendJson(res, 200, { success: result.success });
+          } catch (error) {
+            return sendAccountLinksError(res, error);
+          }
+        }
+
+        if (req.method === "DELETE" && ["/account-links/github", "/account-links/email"].includes(pathname)) {
+          try {
+            const provider = pathname.endsWith("/github") ? "github" : "email";
+            return sendJson(res, 200, await accountLinksService.unlink(getLinkedWallet(), provider));
+          } catch (error) {
+            return sendAccountLinksError(res, error);
+          }
         }
 
         // ── OAuth 2.0 Authorization Server (#744) ───────────────────────

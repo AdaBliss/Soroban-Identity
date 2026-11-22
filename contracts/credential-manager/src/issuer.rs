@@ -1,5 +1,6 @@
 use soroban_sdk::{symbol_short, Address, Env, Vec};
 use crate::keys::{ADMIN, ISSUER};
+use crate::roles::{self, Role};
 use crate::threshold::{SignedPayload, SignerSet};
 
 /// Maximum number of issuers that may be whitelisted at once.
@@ -39,6 +40,9 @@ pub fn get_issuers(env: &Env) -> Vec<Address> {
 pub fn require_issuer(env: &Env, issuer: &Address) {
     if !get_issuers(env).contains(issuer) {
         panic!("not a registered issuer");
+    }
+    if !roles::has_role(env, issuer, Role::Issuer) && !roles::has_role(env, issuer, Role::Owner) {
+        panic!("caller lacks issuer role");
     }
 }
 

@@ -22,6 +22,8 @@ const NetworkStatistics = lazy(() => import("./components/NetworkStatistics"));
 const ActivityFeed = lazy(() => import("./components/ActivityFeed"));
 const CustomizableDashboard = lazy(() => import("./components/CustomizableDashboard"));
 const PrivacySettings = lazy(() => import("./components/privacy/PrivacySettings"));
+const BiometricDeviceManager = lazy(() => import("./components/BiometricDeviceManager"));
+const NotificationPreferences = lazy(() => import("./components/NotificationPreferences"));
 const { isShareLinkExpired } = await import("./components/privacy/shareLinks");
 
 const preloadCredentialsPanel = () => {
@@ -42,6 +44,9 @@ const preloadCustomizableDashboard = () => {
 const preloadPrivacySettings = () => {
   void import("./components/privacy/PrivacySettings");
 };
+const preloadBiometricDeviceManager = () => {
+  void import("./components/BiometricDeviceManager");
+};
 import WalletButton from "./components/WalletButton";
 import QRScanner from "./components/QRScanner";
 import { TourProvider, useTour } from "./context/TourContext";
@@ -53,12 +58,14 @@ import { useWallet } from "./hooks/useWallet";
 import { useCredentialExpiryCheck } from "./hooks/useCredentialExpiryCheck";
 import { useTheme, cycleTheme, getThemeIcon, getThemeLabel } from "./hooks/useTheme";
 import { useServiceWorker } from "./hooks/useServiceWorker";
+import { useInstallPrompt } from "./hooks/useInstallPrompt";
 import OfflineIndicator from "./components/OfflineIndicator";
 import {
-  DEFAULT_NETWORK,
   NETWORK_CONFIGS,
   NETWORK_OPTIONS,
+  getActiveNetwork,
   isMainnet,
+  persistActiveNetwork,
   type NetworkName,
 } from "./network";
 import { checkConnection, IdentityClient, CredentialClient, ReputationClient } from "../../sdk/src/index";
@@ -83,6 +90,7 @@ export enum Tab {
   CredentialAnalytics = "credentialAnalytics",
   Dashboard = "dashboard",
   Privacy = "privacy",
+  ConnectedAccounts = "connectedAccounts",
 }
 
 const TAB_ORDER: Tab[] = [
@@ -94,12 +102,82 @@ const TAB_ORDER: Tab[] = [
   Tab.CredentialAnalytics,
   Tab.Dashboard,
   Tab.Privacy,
+  Tab.ConnectedAccounts,
 ];
+
+// #1264: dismissible mobile install banner. Hidden when the app is already
+// installed, when the browser has not offered an install prompt, or when the
+// user has dismissed it (persisted in localStorage by the hook).
+function InstallPromptBanner() {
+  const { t } = useTranslation();
+  const { canInstall, isInstalled, promptInstall, dismiss } = useInstallPrompt();
+
+  if (!canInstall || isInstalled) return null;
+
+  return (
+    <div
+      role="region"
+      aria-label={t("pwa.installTitle", "Install app")}
+      className="install-prompt-banner"
+      data-testid="install-prompt-banner"
+      style={{
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-between",
+        gap: "0.75rem",
+        background: "var(--info-bg, #e7f1ff)",
+        color: "var(--info-text, #0b4a8f)",
+        border: "1px solid var(--info-border, #9ec5fe)",
+        borderRadius: "0.5rem",
+        padding: "0.6rem 1rem",
+        marginBottom: "1rem",
+        fontSize: "0.9rem",
+      }}
+    >
+      <span>
+        <span aria-hidden="true">📲</span>{" "}
+        {t("pwa.installMessage", "Install this app for offline access and a faster experience.")}
+      </span>
+      <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+        <button
+          type="button"
+          onClick={() => void promptInstall()}
+          style={{
+            background: "none",
+            border: "1px solid currentColor",
+            borderRadius: "0.25rem",
+            padding: "0.2rem 0.6rem",
+            cursor: "pointer",
+            fontSize: "0.8rem",
+            fontWeight: 600,
+            color: "inherit",
+          }}
+        >
+          {t("pwa.install", "Install")}
+        </button>
+        <button
+          type="button"
+          onClick={dismiss}
+          aria-label={t("pwa.dismiss", "Dismiss install prompt")}
+          style={{
+            background: "none",
+            border: "none",
+            cursor: "pointer",
+            fontSize: "1rem",
+            color: "inherit",
+          }}
+        >
+          ✕
+        </button>
+      </div>
+    </div>
+  );
+}
 
 function AppContent() {
   const [tab, setTab] = useState<Tab>(Tab.Identity);
   const tabRefs = useRef<Partial<Record<Tab, HTMLButtonElement | null>>>({});
-  const [activeNetwork, setActiveNetwork] = useState<NetworkName>(DEFAULT_NETWORK);
+  const [activeNetwork, setActiveNetwork] = useState<NetworkName>(getActiveNetwork);
   const [verifyId, setVerifyId] = useState<string | null>(null);
   const [scanning, setScanning] = useState(false);
   const [deepLinkEncrypted, setDeepLinkEncrypted] = useState<{ c: string; k: string } | null>(null);
@@ -108,6 +186,9 @@ function AppContent() {
   // Credential currently open for collaborative editing (#1105).
   const [activeCredentialId, setActiveCredentialId] = useState<string | null>(null);
   const networkConfig = NETWORK_CONFIGS[activeNetwork];
+  useEffect(() => {
+    persistActiveNetwork(activeNetwork);
+  }, [activeNetwork]);
   const wallet = useWallet(networkConfig);
   const [theme, setTheme, isDarkMode] = useTheme();
   const { t, i18n } = useTranslation();
@@ -116,7 +197,10 @@ function AppContent() {
   const [menuOpen, setMenuOpen] = useState(false);
   const menuButtonRef = useRef<HTMLButtonElement | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
-  
+
+  // #1264: register the service worker for offline caching of static assets.
+  useServiceWorker();
+
   // Keyboard shortcuts
   const { enabled: shortcutsEnabled, toggleHelp: toggleShortcutsHelp, showHelp: showShortcutsHelp } = useKeyboardShortcutsContext();
   const searchInputRef = useRef<HTMLInputElement | null>(null);
@@ -548,6 +632,8 @@ function AppContent() {
 
       <OfflineIndicator />
 
+      <InstallPromptBanner />
+
       {settingsOpen && (
         <section
           id="settings-panel"
@@ -556,6 +642,7 @@ function AppContent() {
         >
           <Suspense fallback={<LoadingFallback />}>
             <BiometricDeviceManager />
+            <NotificationPreferences />
           </Suspense>
         </section>
       )}
@@ -743,6 +830,14 @@ function AppContent() {
         <ErrorBoundary>
           <Suspense fallback={<LoadingFallback />}>
           <ViewTransition viewKey={tab}>
+          <div
+            id={`panel-${Tab.ConnectedAccounts}`}
+            role="tabpanel"
+            aria-labelledby={`tab-${Tab.ConnectedAccounts}`}
+            hidden={tab !== Tab.ConnectedAccounts}
+          >
+            {tab === Tab.ConnectedAccounts && <ConnectedAccountsPanel wallet={wallet} />}
+          </div>
           <div
             id={`panel-${Tab.Identity}`}
             role="tabpanel"
@@ -941,13 +1036,4 @@ export default function App() {
   return (
     <TourProvider>
       <CollaborationProvider
-        websocketUrl={COLLABORATION_CONFIG.websocketUrl}
-        user={null}
-        defaultRole={COLLABORATION_CONFIG.defaultRole}
-      >
-        <AppContent />
-      </CollaborationProvider>
-      <TourOverlayWrapper />
-    </TourProvider>
-  );
-}
+        webs
