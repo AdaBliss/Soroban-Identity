@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { DidDocument } from "../../../sdk/src/types";
 import { IdentityClient } from "../../../sdk/src/identity";
 import { getNetworkConfig } from "../network";
@@ -10,8 +10,10 @@ export function identityMatchesQuery(identity: DidDocument, query: string): bool
   const normalizedQuery = query.trim().toLowerCase();
   if (!normalizedQuery) return true;
 
-  const name = identity.metadata?.name ?? identity.metadata?.displayName ?? "";
-  return [identity.id, identity.controller, name].some((value) =>
+  const names = [identity.metadata?.name, identity.metadata?.displayName].filter(
+    (value): value is string => Boolean(value)
+  );
+  return [identity.id, identity.controller, ...names].some((value) =>
     value.toLowerCase().includes(normalizedQuery)
   );
 }
@@ -38,14 +40,20 @@ interface IdentityDirectoryProps {
 export default function IdentityDirectory({ wallet, onSelectIdentity }: IdentityDirectoryProps) {
   const [identities, setIdentities] = useState<DidDocument[]>([]);
   const [query, setQuery] = useState("");
+  const [debouncedQuery, setDebouncedQuery] = useState("");
   const [status, setStatus] = useState<StatusFilter>("all");
   const [loading, setLoading] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  useEffect(() => {
+    const timeout = window.setTimeout(() => setDebouncedQuery(query), 250);
+    return () => window.clearTimeout(timeout);
+  }, [query]);
+
   const visibleIdentities = useMemo(
-    () => filterIdentities(identities, query, status),
-    [identities, query, status]
+    () => filterIdentities(identities, debouncedQuery, status),
+    [identities, debouncedQuery, status]
   );
 
   const loadIdentities = async () => {

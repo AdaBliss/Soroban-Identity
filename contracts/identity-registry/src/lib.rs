@@ -1015,6 +1015,7 @@ impl IdentityRegistry {
             let Some(controller) = storage.get::<_, Address>(&index_key) else {
                 continue;
             };
+            storage.extend_ttl(&index_key, TTL_BUMP_THRESHOLD, TTL_LEDGERS);
             if let Some(document) = storage.get::<_, DidDocument>(&Self::did_key(&env, &controller)) {
                 result.push_back(document);
             }
@@ -1268,6 +1269,7 @@ impl IdentityRegistry {
         let total: u32 = env.storage().instance().get(&TOTAL_DIDS).unwrap_or(0);
         let index_key = (DID_INDEX, total);
         storage.set(&index_key, &controller);
+        storage.extend_ttl(&index_key, TTL_BUMP_THRESHOLD, TTL_LEDGERS);
         env.storage().instance().set(&TOTAL_DIDS, &(total + 1));
         env.events().publish((IDENTITY, symbol_short!("created")), (EVENT_VERSION, controller.clone(), now));
         Ok(did_id)

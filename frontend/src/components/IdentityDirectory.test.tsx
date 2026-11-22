@@ -31,6 +31,14 @@ describe("IdentityDirectory filtering", () => {
     expect(identityMatchesQuery(identities[0], "missing")).toBe(false);
   });
 
+  it("matches either supported metadata name field", () => {
+    const identity = {
+      ...identities[0],
+      metadata: { name: "Alice", displayName: "Administrator" },
+    };
+    expect(identityMatchesQuery(identity, "administrator")).toBe(true);
+  });
+
   it("filters identities by query and active status", () => {
     expect(filterIdentities(identities, "", "active")).toEqual([identities[0]]);
     expect(filterIdentities(identities, "", "inactive")).toEqual([identities[1]]);
